@@ -11,3 +11,4 @@ dependencies = []
 
 [project.optional-dependencies]
 llm = ["litellm>=1.70,<2"]
+browser = ["playwright==1.62.0"]
