@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-reuse"
+version = "0.0.1"
+description = "A small learning project for exploring Agent-to-Recipe workflows."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+llm = ["litellm>=1.70,<2"]
