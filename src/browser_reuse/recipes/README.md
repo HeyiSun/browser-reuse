@@ -1,3 +1,3 @@
 # Recipes
 
-Reserved for trajectory recording, recipe generation, and replay in roadmap phase 3. This directory currently defines no Python API.
+Phase 2 may add the smallest compiler and deterministic replay functions justified by the current typed-trajectory experiment. General locator fallback and recovery remain later work.
