@@ -1,3 +1,3 @@
 # Agents
 
-Phase 2 may add only the minimal framework-neutral trajectory recording needed by the current Agent-to-Recipe experiment. SlotLab prompts and booking policy remain under `experiments/`.
+Phase 2 currently exposes only `RecordedAction`: one successfully executed adapter action with its public before/after observations. SlotLab prompts, typed booking decisions, and policy rules remain under `experiments/`.
