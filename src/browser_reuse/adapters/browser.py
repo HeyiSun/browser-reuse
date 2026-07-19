@@ -11,11 +11,19 @@ from typing import Protocol, TypeAlias
 class CssTarget:
     selector: str
 
+    def __post_init__(self) -> None:
+        if not self.selector:
+            raise ValueError("css selector must not be empty")
+
 
 @dataclass(frozen=True)
 class RoleTarget:
     role: str
     name: str
+
+    def __post_init__(self) -> None:
+        if not self.role or not self.name:
+            raise ValueError("role and name must not be empty")
 
 
 BrowserTarget: TypeAlias = CssTarget | RoleTarget
@@ -25,17 +33,30 @@ BrowserTarget: TypeAlias = CssTarget | RoleTarget
 class Click:
     target: BrowserTarget
 
+    def __post_init__(self) -> None:
+        _validate_target(self.target)
+
 
 @dataclass(frozen=True)
 class Fill:
     target: BrowserTarget
     value: str
 
+    def __post_init__(self) -> None:
+        _validate_target(self.target)
+        if not isinstance(self.value, str):
+            raise ValueError("fill value must be a string")
+
 
 @dataclass(frozen=True)
 class SelectOption:
     target: BrowserTarget
     label: str
+
+    def __post_init__(self) -> None:
+        _validate_target(self.target)
+        if not self.label:
+            raise ValueError("select option label must not be empty")
 
 
 BrowserAction: TypeAlias = Click | Fill | SelectOption
@@ -82,6 +103,13 @@ def action_to_step(action: BrowserAction) -> dict[str, object]:
 
 def action_from_step(step: Mapping[str, object]) -> BrowserAction:
     operation = step.get("op")
+    expected_keys = {
+        "click": {"op", "target"},
+        "fill": {"op", "target", "value"},
+        "select_option": {"op", "target", "label"},
+    }
+    if operation not in expected_keys or set(step) != expected_keys[operation]:
+        raise ValueError(f"invalid browser action fields: {operation!r}")
     target = _target_from_mapping(step.get("target"))
     if operation == "click":
         return Click(target)
@@ -108,6 +136,11 @@ def _resolve(page: _Page, target: BrowserTarget) -> _Locator:
     return page.get_by_role(target.role, name=target.name, exact=True)
 
 
+def _validate_target(target: object) -> None:
+    if not isinstance(target, (CssTarget, RoleTarget)):
+        raise ValueError("browser action target has an unsupported type")
+
+
 def _target_to_mapping(target: BrowserTarget) -> dict[str, str]:
     if isinstance(target, CssTarget):
         return {"by": "css", "selector": target.selector}
@@ -119,11 +152,16 @@ def _target_from_mapping(value: object) -> BrowserTarget:
         raise ValueError("browser action requires a target mapping")
     strategy = value.get("by")
     if strategy == "css":
+        if set(value) != {"by", "selector"}:
+            raise ValueError("invalid css target fields")
         selector = value.get("selector")
         if not isinstance(selector, str) or not selector:
             raise ValueError("css target requires a non-empty selector")
         return CssTarget(selector)
     if strategy in {None, "role"}:
+        expected = {"role", "name"} if strategy is None else {"by", "role", "name"}
+        if set(value) != expected:
+            raise ValueError("invalid role target fields")
         role = value.get("role")
         name = value.get("name")
         if not isinstance(role, str) or not role:

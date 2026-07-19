@@ -12,16 +12,19 @@ from .browser import (
     execute_browser_action,
     execute_browser_step,
 )
+from .playwright import BrowserSession, PlaywrightRuntime
 
 __all__ = [
     "action_from_step",
     "action_to_step",
     "BrowserAction",
+    "BrowserSession",
     "Click",
     "CssTarget",
     "execute_browser_action",
     "execute_browser_step",
     "Fill",
     "RoleTarget",
+    "PlaywrightRuntime",
     "SelectOption",
 ]

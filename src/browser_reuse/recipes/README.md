@@ -1,3 +1,3 @@
 # Recipes
 
-Phase 2 currently exposes `compile_recipe()` and `replay_recipe()`. Compilation preserves state-changing recorded actions and removes exact observed no-ops; replay executes the finite steps in order and stops on the first adapter error. General locator fallback and recovery remain later work.
+The formal recipe boundary contains verified compilation, canonical JSON-compatible payload conversion, deterministic replay, and fail-closed replay progress. Compilation preserves every successful action and deep-snapshots nested mappings; observation equality is not treated as proof of no side effect. General locator fallback and Hybrid recovery remain scenario-owned.
