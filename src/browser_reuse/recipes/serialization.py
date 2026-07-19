@@ -16,7 +16,9 @@ def recipe_from_payload(payload: object) -> Recipe:
     if not isinstance(payload, Mapping) or set(payload) != {"steps"}:
         raise ValueError("recipe payload must contain exactly steps")
     steps = payload["steps"]
-    if not isinstance(steps, list) or not all(isinstance(step, Mapping) for step in steps):
+    if not isinstance(steps, list) or not all(
+        isinstance(step, Mapping) for step in steps
+    ):
         raise ValueError("recipe steps must be a list of objects")
     return Recipe(steps=tuple(snapshot_step(step) for step in steps))
 

@@ -40,7 +40,12 @@ def run_agent_loop(
         observation = adapter.observe()
         while decisions < max_decisions:
             if is_terminal(observation):
-                return AgentRun(True, tuple(actions), decisions, last_response=response)
+                return AgentRun(
+                    True,
+                    tuple(actions),
+                    decisions,
+                    last_response=response,
+                )
             response = model.complete(make_messages(task, observation))
             decisions += 1
             step = parse_step(response, observation)
