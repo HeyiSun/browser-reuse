@@ -30,6 +30,7 @@ def run_agent_loop(
     parse_step: Callable[[str, Observation], Mapping[str, object] | None],
     is_terminal: Callable[[Observation], bool],
     max_decisions: int,
+    allow_done_claim: bool = False,
 ) -> AgentRun:
     if max_decisions < 1:
         raise ValueError("max_decisions must be at least 1")
@@ -51,10 +52,10 @@ def run_agent_loop(
             step = parse_step(response, observation)
             if step is None:
                 return AgentRun(
-                    False,
+                    allow_done_claim,
                     tuple(actions),
                     decisions,
-                    "premature done",
+                    None if allow_done_claim else "premature done",
                     response,
                 )
             adapter.execute(step)
