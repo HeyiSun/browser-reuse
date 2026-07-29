@@ -1,5 +1,6 @@
 """Framework adapters that remain outside browser-reuse core types."""
 
+from .aria import GenericBrowserAdapter
 from .browser import (
     BrowserAction,
     Click,
@@ -24,6 +25,7 @@ __all__ = [
     "execute_browser_action",
     "execute_browser_step",
     "Fill",
+    "GenericBrowserAdapter",
     "RoleTarget",
     "PlaywrightRuntime",
     "SelectOption",
