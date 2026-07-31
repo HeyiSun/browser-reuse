@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from browser_reuse.core import Observation, TaskSpec
 from browser_reuse.interfaces import Adapter
 from browser_reuse.llm import ChatModel, Message
 
-from .trajectory import RecordedAction
+from .trajectory import ActionPlan, RecordedAction
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ def run_agent_loop(
     model: ChatModel,
     *,
     make_messages: Callable[[TaskSpec, Observation], Sequence[Message]],
-    parse_step: Callable[[str, Observation], Mapping[str, object] | None],
+    parse_step: Callable[[str, Observation], ActionPlan | None],
     is_terminal: Callable[[Observation], bool],
     max_decisions: int,
     allow_done_claim: bool = False,
@@ -49,8 +49,8 @@ def run_agent_loop(
                 )
             response = model.complete(make_messages(task, observation))
             decisions += 1
-            step = parse_step(response, observation)
-            if step is None:
+            plan = parse_step(response, observation)
+            if plan is None:
                 return AgentRun(
                     allow_done_claim,
                     tuple(actions),
@@ -58,11 +58,16 @@ def run_agent_loop(
                     None if allow_done_claim else "premature done",
                     response,
                 )
-            adapter.execute(step)
+            adapter.execute(plan.execute_step)
             after = adapter.observe()
             actions.append(
                 RecordedAction(
-                    action=dict(step),
+                    execute_step=dict(plan.execute_step),
+                    recipe_step=(
+                        dict(plan.recipe_step)
+                        if plan.recipe_step is not None
+                        else None
+                    ),
                     before=observation,
                     after=after,
                 )

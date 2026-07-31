@@ -11,9 +11,10 @@ from browser_reuse.interfaces import Adapter
 from browser_reuse.llm import ChatModel, Message
 
 from .loop import AgentRun, run_agent_loop
+from .trajectory import ActionPlan
 
 
-GENERIC_BROWSER_PROMPT = """You operate a webpage from a public accessibility snapshot.
+GENERIC_BROWSER_PROMPT = """You operate a webpage from a public DOM+accessibility snapshot.
 Return exactly one JSON object and no markdown:
 {"action":"click","ref":"e12"}
 {"action":"fill","ref":"e13","value":"text"}
@@ -58,7 +59,7 @@ def run_generic_browser_agent(
     def parse_step(
         content: str,
         observation: Observation,
-    ) -> Mapping[str, object] | None:
+    ) -> ActionPlan | None:
         nonlocal snapshot_before_action
         step = _parse_step(content, observation)
         if step is not None:
@@ -132,7 +133,7 @@ def _messages(
 def _parse_step(
     content: str,
     observation: Observation,
-) -> Mapping[str, object] | None:
+) -> ActionPlan | None:
     value = json.loads(content)
     if not isinstance(value, dict):
         raise ValueError("model decision must be an object")
@@ -150,19 +151,36 @@ def _parse_step(
     if not isinstance(ref, str):
         raise ValueError("model browser action requires a string ref")
     control = _find_control(observation, ref, operation)
-    step: dict[str, object] = {"op": operation, "target": control["target"]}
+    snapshot_token = observation.data.get("snapshot_token")
+    if not isinstance(snapshot_token, str) or not snapshot_token:
+        raise ValueError("browser observation contains no snapshot identity")
+    execute_step: dict[str, object] = {
+        "op": operation,
+        "target": {
+            "by": "ref",
+            "snapshot": snapshot_token,
+            "ref": ref,
+        },
+    }
     if operation == "fill":
         fill_value = value.get("value")
         if not isinstance(fill_value, str):
             raise ValueError("fill value must be a string")
-        step["value"] = fill_value
+        execute_step["value"] = fill_value
     elif operation == "select_option":
         label = value.get("label")
         labels = control.get("labels", ())
         if not isinstance(label, str) or label not in labels:
             raise ValueError("select label is not present in the observation")
-        step["label"] = label
-    return action_to_step(action_from_step(step))
+        execute_step["label"] = label
+
+    target = control.get("target")
+    recipe_step: dict[str, object] | None = None
+    if isinstance(target, Mapping):
+        durable_step = dict(execute_step)
+        durable_step["target"] = target
+        recipe_step = action_to_step(action_from_step(durable_step))
+    return ActionPlan(execute_step=execute_step, recipe_step=recipe_step)
 
 
 def _find_control(
@@ -175,7 +193,6 @@ def _find_control(
     if (
         not isinstance(control, Mapping)
         or control.get("op") != operation
-        or not isinstance(control.get("target"), Mapping)
     ):
         raise ValueError("model ref/action is not present in the observation")
     return control

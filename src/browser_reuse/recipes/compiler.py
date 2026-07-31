@@ -10,11 +10,15 @@ from .serialization import snapshot_step
 
 
 def compile_recipe(actions: Sequence[RecordedAction]) -> Recipe:
-    """Deep-snapshot every successfully executed action in order."""
+    """Deep-snapshot every replayable recipe step in order."""
 
-    return Recipe(
-        steps=tuple(snapshot_step(record.action) for record in actions)
-    )
+    recipe_steps: list[dict[str, object]] = []
+    for action in actions:
+        if action.recipe_step is None:
+            raise ValueError("trajectory contains an action without a recipe step")
+        recipe_steps.append(snapshot_step(action.recipe_step))
+
+    return Recipe(steps=tuple(recipe_steps))
 
 
 def compile_verified_recipe(
@@ -22,5 +26,7 @@ def compile_verified_recipe(
     result: ExecutionResult,
 ) -> Recipe | None:
     if not run.claimed_success or run.error is not None or not result.success:
+        return None
+    if any(action.recipe_step is None for action in run.actions):
         return None
     return compile_recipe(run.actions)

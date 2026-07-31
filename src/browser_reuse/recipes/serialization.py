@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 
 from browser_reuse.core import Recipe
@@ -30,4 +31,30 @@ def snapshot_step(step: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("recipe step must be JSON-compatible") from exc
     if not isinstance(value, dict):
         raise ValueError("recipe step must be an object")
+    _reject_transient_browser_identity(value)
     return value
+
+
+def _reject_transient_browser_identity(step: Mapping[str, object]) -> None:
+    forbidden_keys = {"backendNodeId", "backendDOMNodeId", "snapshot_token"}
+
+    def visit(value: object) -> None:
+        if isinstance(value, Mapping):
+            if forbidden_keys.intersection(value):
+                raise ValueError("recipe step contains transient browser identity")
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(step)
+    target = step.get("target")
+    if not isinstance(target, Mapping):
+        return
+    if target.get("by") == "ref":
+        raise ValueError("snapshot-local browser refs cannot enter a recipe")
+    selector = target.get("selector")
+    if target.get("by") == "css" and isinstance(selector, str):
+        if re.search(r"^(?:xpath\s*=|//|/|\.//|\(\s*//)", selector, re.I):
+            raise ValueError("XPath cannot enter a durable browser recipe")

@@ -1,4 +1,4 @@
-"""Framework-neutral record of one successfully executed Agent action."""
+"""Framework-neutral plan and record for one Agent action."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -7,9 +7,18 @@ from browser_reuse.core import Observation
 
 
 @dataclass(frozen=True)
-class RecordedAction:
-    """An adapter action together with its public before/after observations."""
+class ActionPlan:
+    """One immediate adapter step and its optional replayable counterpart."""
 
-    action: Mapping[str, object]
+    execute_step: Mapping[str, object]
+    recipe_step: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
+class RecordedAction:
+    """A completed plan together with its public before/after observations."""
+
+    execute_step: Mapping[str, object]
+    recipe_step: Mapping[str, object] | None
     before: Observation
     after: Observation

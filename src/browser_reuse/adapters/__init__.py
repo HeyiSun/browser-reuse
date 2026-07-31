@@ -1,10 +1,10 @@
 """Framework adapters that remain outside browser-reuse core types."""
 
-from .aria import GenericBrowserAdapter
 from .browser import (
     BrowserAction,
     Click,
     CssTarget,
+    ElementWitness,
     Fill,
     RoleTarget,
     SelectOption,
@@ -13,6 +13,7 @@ from .browser import (
     execute_browser_action,
     execute_browser_step,
 )
+from .generic import GenericBrowserAdapter
 from .playwright import BrowserSession, PlaywrightRuntime
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "BrowserSession",
     "Click",
     "CssTarget",
+    "ElementWitness",
     "execute_browser_action",
     "execute_browser_step",
     "Fill",
