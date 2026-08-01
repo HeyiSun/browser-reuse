@@ -206,7 +206,7 @@ def _public_controls(
             continue
         available[ref] = {
             key: control[key]
-            for key in ("op", "name", "value", "labels")
+            for key in ("op", "name", "value", "labels", "state")
             if key in control
         }
     return available

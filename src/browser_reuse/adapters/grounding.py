@@ -547,6 +547,9 @@ class DomAxGrounder:
             return None
 
         control: dict[str, object] = {"op": operation, "name": name}
+        public_state = _public_dom_state(dom_node.attributes)
+        if public_state:
+            control["state"] = public_state
         if operation == "fill" and not _is_secret(dom_node.attributes, name):
             control["value"] = locator.input_value()
         elif operation == "select_option":
@@ -973,3 +976,15 @@ def _is_secret(attributes: Mapping[str, str], accessible_name: str) -> bool:
         )
     )
     return _SECRET_TEXT.search(hints) is not None
+
+
+def _public_dom_state(attributes: Mapping[str, str]) -> dict[str, str]:
+    state: dict[str, str] = {}
+    for key in ("aria-pressed", "aria-selected", "aria-checked", "data-state"):
+        value = attributes.get(key)
+        if value:
+            state[key] = value[:100]
+    class_name = attributes.get("class", "").strip()
+    if class_name:
+        state["class"] = class_name[:200]
+    return state
