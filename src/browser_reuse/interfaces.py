@@ -6,6 +6,10 @@ from typing import Protocol
 from .core import Observation, TaskSpec
 
 
+class ActionDispatchedError(RuntimeError):
+    """The side effect returned, but post-action settling failed."""
+
+
 class Adapter(Protocol):
     def observe(self) -> Observation:
         ...

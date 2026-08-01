@@ -2,44 +2,26 @@
 
 from __future__ import annotations
 
-import secrets
 from collections.abc import Mapping
 from typing import Protocol
 
 from browser_reuse.core import Observation
+from browser_reuse.interfaces import ActionDispatchedError
 
-from .browser import BrowserAction, CssTarget, Fill, action_from_step
-from .grounding import DomAxGrounder, REF_ATTRIBUTE, witness_matches
+from .browser import (
+    BrowserAction,
+    CssTarget,
+    Fill,
+    SelectOption,
+    action_from_step,
+)
+from .grounding import DOM_REVISION_SCRIPT, DomAxGrounder, witness_matches
 
 
 _POLL_MS = 200
 _MIN_POLLS = 3
 _STABLE_MATCHES = 2
 _MAX_POLLS = 40
-_QUIET_STATE_SCRIPT = f"""() => {{
-    const key = '__browser_reuseDomQuietV1';
-    if (!globalThis[key]) {{
-        const state = {{version: 0}};
-        const observer = new MutationObserver((mutations) => {{
-            if (mutations.some(mutation => !(
-                mutation.type === 'attributes' &&
-                mutation.attributeName === '{REF_ATTRIBUTE}'
-            ))) {{
-                state.version += 1;
-            }}
-        }});
-        if (document.documentElement) {{
-            observer.observe(document.documentElement, {{
-                attributes: true,
-                childList: true,
-                characterData: true,
-                subtree: true,
-            }});
-        }}
-        globalThis[key] = state;
-    }}
-    return {{ready: document.readyState, version: globalThis[key].version}};
-}}"""
 
 
 class _Locator(Protocol):
@@ -119,7 +101,12 @@ class GenericBrowserAdapter:
             self._execute_ref_step(step, target)
         else:
             self._execute_durable_step(step)
-        self._wait_until_stable()
+        try:
+            self._wait_until_stable()
+        except Exception as exc:
+            raise ActionDispatchedError(
+                "browser action was dispatched but the page did not settle"
+            ) from exc
 
     def _execute_ref_step(
         self,
@@ -140,7 +127,13 @@ class GenericBrowserAdapter:
         ref = target.get("ref")
         if not isinstance(token, str) or not isinstance(ref, str):
             raise ValueError("snapshot-ref target requires string identity")
-        locator = self._grounder.resolve_ref(token, ref, str(operation))
+        label = step.get("label") if operation == "select_option" else None
+        locator = self._grounder.resolve_ref(
+            token,
+            ref,
+            str(operation),
+            label=label if isinstance(label, str) else None,
+        )
         _execute_locator(locator, operation, step)
 
     def _execute_durable_step(self, step: Mapping[str, object]) -> None:
@@ -157,6 +150,8 @@ class GenericBrowserAdapter:
             raise ValueError("browser target is no longer actionable")
         if isinstance(action, Fill) and not locator.is_editable():
             raise ValueError("browser fill target is no longer editable")
+        if isinstance(action, SelectOption):
+            _validate_select_label(locator, action.label)
         _execute_locator(locator, step.get("op"), step)
 
     def _resolve(self, action: BrowserAction) -> _Locator:
@@ -174,37 +169,14 @@ class GenericBrowserAdapter:
         locator: _Locator,
         target: CssTarget,
     ) -> bool:
-        witness = target.witness
-        if witness.role is None or witness.name is None:
-            return True
-        marker = f"verify:{secrets.token_hex(8)}"
-        try:
-            locator.evaluate(
-                f"(element, value) => element.setAttribute('{REF_ATTRIBUTE}', value)",
-                marker,
-            )
-            semantic = self._page.get_by_role(
-                witness.role,
-                name=witness.name,
-                exact=True,
-            )
-            return semantic.count() == 1 and semantic.get_attribute(
-                REF_ATTRIBUTE
-            ) == marker
-        finally:
-            try:
-                locator.evaluate(
-                    f"element => element.removeAttribute('{REF_ATTRIBUTE}')"
-                )
-            except Exception:
-                pass
+        return self._grounder.semantic_witness_matches(locator, target.witness)
 
     def _wait_until_stable(self) -> None:
         previous: tuple[str, str, int] | None = None
         stable_matches = 0
         for poll in range(_MAX_POLLS):
             self._page.wait_for_timeout(_POLL_MS)
-            state = self._page.evaluate(_QUIET_STATE_SCRIPT)
+            state = self._page.evaluate(DOM_REVISION_SCRIPT)
             if not isinstance(state, Mapping):
                 raise RuntimeError("browser did not return DOM quiet state")
             ready = state.get("ready")
@@ -226,6 +198,8 @@ class GenericBrowserAdapter:
         raise TimeoutError("page did not reach a bounded network and DOM quiet state")
 
     def _request_started(self, request: object) -> None:
+        if getattr(request, "resource_type", "") in {"websocket", "eventsource"}:
+            return
         self._pending_requests.add(request)
 
     def _request_finished(self, request: object) -> None:
@@ -253,3 +227,13 @@ def _execute_locator(
         locator.select_option(label=label)
         return
     raise ValueError(f"unknown browser action: {operation!r}")
+
+
+def _validate_select_label(locator: _Locator, label: str) -> None:
+    labels = locator.evaluate(
+        """element => Array.from(element.options)
+            .filter(option => !option.disabled && !option.hidden && option.value)
+            .map(option => option.textContent.trim())"""
+    )
+    if not isinstance(labels, list) or labels.count(label) != 1:
+        raise ValueError("select option label is no longer unique")

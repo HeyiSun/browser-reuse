@@ -40,14 +40,14 @@ def run_generic_browser_agent(
     max_decisions: int = 35,
 ) -> AgentRun:
     recent_actions: list[dict[str, object]] = []
-    snapshot_before_action: object = None
+    public_state_before_action: object = None
 
     def messages(task: TaskSpec, observation: Observation) -> tuple[Message, ...]:
-        current_snapshot = observation.data.get("snapshot")
+        current_public_state = _public_state(observation)
         changed = (
             None
             if not recent_actions
-            else current_snapshot != snapshot_before_action
+            else current_public_state != public_state_before_action
         )
         return _messages(
             task,
@@ -60,7 +60,7 @@ def run_generic_browser_agent(
         content: str,
         observation: Observation,
     ) -> ActionPlan | None:
-        nonlocal snapshot_before_action
+        nonlocal public_state_before_action
         step = _parse_step(content, observation)
         if step is not None:
             decision = json.loads(content)
@@ -70,7 +70,7 @@ def run_generic_browser_agent(
                 if key in decision
             })
             del recent_actions[:-6]
-            snapshot_before_action = observation.data.get("snapshot")
+            public_state_before_action = _public_state(observation)
         return step
 
     return run_agent_loop(
@@ -92,18 +92,7 @@ def _messages(
     recent_actions: Sequence[Mapping[str, object]] = (),
     page_changed_after_last_action: bool | None = None,
 ) -> tuple[Message, ...]:
-    controls = observation.data.get("controls", {})
-    available: dict[str, dict[str, object]] = {}
-    if isinstance(controls, Mapping):
-        for ref, control in controls.items():
-            if not isinstance(ref, str) or not isinstance(control, Mapping):
-                continue
-            public = {
-                key: control[key]
-                for key in ("op", "name", "value", "labels")
-                if key in control
-            }
-            available[ref] = public
+    available = _public_controls(observation)
     return (
         Message(role="system", content=GENERIC_BROWSER_PROMPT),
         Message(
@@ -196,3 +185,28 @@ def _find_control(
     ):
         raise ValueError("model ref/action is not present in the observation")
     return control
+
+
+def _public_state(observation: Observation) -> dict[str, object]:
+    return {
+        "snapshot": observation.data.get("snapshot"),
+        "controls": _public_controls(observation),
+    }
+
+
+def _public_controls(
+    observation: Observation,
+) -> dict[str, dict[str, object]]:
+    controls = observation.data.get("controls", {})
+    available: dict[str, dict[str, object]] = {}
+    if not isinstance(controls, Mapping):
+        return available
+    for ref, control in controls.items():
+        if not isinstance(ref, str) or not isinstance(control, Mapping):
+            continue
+        available[ref] = {
+            key: control[key]
+            for key in ("op", "name", "value", "labels")
+            if key in control
+        }
+    return available

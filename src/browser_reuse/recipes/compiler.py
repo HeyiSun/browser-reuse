@@ -21,10 +21,12 @@ def compile_recipe(actions: Sequence[RecordedAction]) -> Recipe:
     return Recipe(steps=tuple(recipe_steps))
 
 
-def compile_verified_recipe(
+def compile_candidate_recipe(
     run: AgentRun,
     result: ExecutionResult,
 ) -> Recipe | None:
+    """Compile a source-verified candidate; fresh replay verifies publication."""
+
     if not run.claimed_success or run.error is not None or not result.success:
         return None
     if any(action.recipe_step is None for action in run.actions):

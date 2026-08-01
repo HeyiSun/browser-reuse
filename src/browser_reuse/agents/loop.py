@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from browser_reuse.core import Observation, TaskSpec
-from browser_reuse.interfaces import Adapter
+from browser_reuse.interfaces import ActionDispatchedError, Adapter
 from browser_reuse.llm import ChatModel, Message
 
 from .trajectory import ActionPlan, RecordedAction
@@ -58,7 +58,22 @@ def run_agent_loop(
                     None if allow_done_claim else "premature done",
                     response,
                 )
-            adapter.execute(plan.execute_step)
+            try:
+                adapter.execute(plan.execute_step)
+            except ActionDispatchedError:
+                actions.append(
+                    RecordedAction(
+                        execute_step=dict(plan.execute_step),
+                        recipe_step=(
+                            dict(plan.recipe_step)
+                            if plan.recipe_step is not None
+                            else None
+                        ),
+                        before=observation,
+                        after=None,
+                    )
+                )
+                raise
             after = adapter.observe()
             actions.append(
                 RecordedAction(

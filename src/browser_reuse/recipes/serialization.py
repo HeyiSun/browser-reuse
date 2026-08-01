@@ -32,6 +32,7 @@ def snapshot_step(step: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("recipe step must be an object")
     _reject_transient_browser_identity(value)
+    _validate_browser_action_schema(value)
     return value
 
 
@@ -58,3 +59,14 @@ def _reject_transient_browser_identity(step: Mapping[str, object]) -> None:
     if target.get("by") == "css" and isinstance(selector, str):
         if re.search(r"^(?:xpath\s*=|//|/|\.//|\(\s*//)", selector, re.I):
             raise ValueError("XPath cannot enter a durable browser recipe")
+
+
+def _validate_browser_action_schema(step: Mapping[str, object]) -> None:
+    if step.get("op") not in {"click", "fill", "select_option"}:
+        return
+    from browser_reuse.adapters.browser import action_from_step
+
+    try:
+        action_from_step(step)
+    except ValueError as exc:
+        raise ValueError("recipe contains a noncanonical browser action") from exc

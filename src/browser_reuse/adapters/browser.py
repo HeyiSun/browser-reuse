@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-import re
 from typing import Protocol, TypeAlias
 
 
@@ -28,7 +28,10 @@ _POSITIONAL_SELECTOR_PATTERN = re.compile(
     r"first-child|last-child|only-child|first-of-type|last-of-type|only-of-type)",
     re.IGNORECASE,
 )
-_FIRST_CLASS_PATTERN = re.compile(r"\.first(?![a-z0-9_-])", re.IGNORECASE)
+_PLAYWRIGHT_ENGINE_PATTERN = re.compile(
+    r"^(?:text|role|id|internal:[a-z-]+|aria-ref)\s*=",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,8 @@ class ElementWitness:
             raise ValueError("witness tag must be a lowercase HTML tag")
         _validate_optional_witness_text("role", self.role)
         _validate_optional_witness_text("name", self.name)
+        if (self.role is None) != (self.name is None):
+            raise ValueError("witness role and name must be present together")
 
         attributes: list[tuple[str, str]] = []
         seen: set[str] = set()
@@ -78,6 +83,8 @@ class CssTarget:
         _validate_durable_css_selector(self.selector)
         if not isinstance(self.witness, ElementWitness):
             raise ValueError("css target requires an element witness")
+        if not self.witness.attributes:
+            raise ValueError("css target witness requires a stable attribute")
 
 
 @dataclass(frozen=True)
@@ -146,7 +153,8 @@ class _Page(Protocol):
     ) -> _Locator: ...
 
 
-def execute_browser_action(page: _Page, action: BrowserAction) -> None:
+def execute_unchecked_browser_action(page: _Page, action: BrowserAction) -> None:
+    """Execute a trusted diagnostic action without replay witness checks."""
     locator = _resolve(page, action.target)
     if isinstance(action, Click):
         locator.click()
@@ -190,8 +198,10 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
     raise ValueError(f"unknown browser action: {operation!r}")
 
 
-def execute_browser_step(page: _Page, step: Mapping[str, object]) -> None:
-    execute_browser_action(page, action_from_step(step))
+def execute_unchecked_browser_step(page: _Page, step: Mapping[str, object]) -> None:
+    """Decode and execute a trusted diagnostic step without witness checks."""
+
+    execute_unchecked_browser_action(page, action_from_step(step))
 
 
 def _resolve(page: _Page, target: BrowserTarget) -> _Locator:
@@ -285,13 +295,40 @@ def _validate_durable_css_selector(selector: object) -> None:
     normalized = selector.strip()
     if normalized != selector:
         raise ValueError("css selector must not contain outer whitespace")
-    if _XPATH_PREFIX_PATTERN.search(normalized):
+    structure = _without_quoted_text(normalized)
+    if _XPATH_PREFIX_PATTERN.search(structure):
         raise ValueError("XPath is not a durable CSS selector")
-    if ">>" in normalized:
+    if _PLAYWRIGHT_ENGINE_PATTERN.search(structure):
+        raise ValueError("Playwright selector engines are not durable CSS")
+    if "data-browser-reuse-ref-" in normalized:
+        raise ValueError("snapshot marker selectors are not durable")
+    if ">>" in structure:
         raise ValueError("chained Playwright selectors are not durable")
-    if "," in normalized:
+    if "," in structure:
         raise ValueError("CSS selector lists are not durable")
-    if _POSITIONAL_SELECTOR_PATTERN.search(normalized) or _FIRST_CLASS_PATTERN.search(
-        normalized
-    ):
+    if _POSITIONAL_SELECTOR_PATTERN.search(structure):
         raise ValueError("positional CSS selectors are not durable")
+
+
+def _without_quoted_text(selector: str) -> str:
+    output: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for character in selector:
+        if quote is not None:
+            output.append(" ")
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            output.append(" ")
+        else:
+            output.append(character)
+    if quote is not None:
+        raise ValueError("css selector contains an unterminated string")
+    return "".join(output)

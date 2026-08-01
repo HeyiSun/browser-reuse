@@ -21,4 +21,4 @@ class RecordedAction:
     execute_step: Mapping[str, object]
     recipe_step: Mapping[str, object] | None
     before: Observation
-    after: Observation
+    after: Observation | None

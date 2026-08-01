@@ -10,8 +10,8 @@ from .browser import (
     SelectOption,
     action_from_step,
     action_to_step,
-    execute_browser_action,
-    execute_browser_step,
+    execute_unchecked_browser_action,
+    execute_unchecked_browser_step,
 )
 from .generic import GenericBrowserAdapter
 from .playwright import BrowserSession, PlaywrightRuntime
@@ -24,8 +24,8 @@ __all__ = [
     "Click",
     "CssTarget",
     "ElementWitness",
-    "execute_browser_action",
-    "execute_browser_step",
+    "execute_unchecked_browser_action",
+    "execute_unchecked_browser_step",
     "Fill",
     "GenericBrowserAdapter",
     "RoleTarget",
