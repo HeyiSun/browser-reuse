@@ -146,6 +146,8 @@ class _Page(Protocol):
 
     def locator(self, selector: str) -> _Locator: ...
 
+    def wait_for_timeout(self, timeout: float) -> None: ...
+
 
 @dataclass(frozen=True)
 class BrowserSnapshot:
@@ -180,6 +182,10 @@ class _Marker:
     value: str
 
 
+class _TransientCaptureError(RuntimeError):
+    pass
+
+
 class DomAxGrounder:
     """Capture one main-document DOM+AX view and bind refs to exact live nodes."""
 
@@ -191,6 +197,16 @@ class DomAxGrounder:
         self._bindings: dict[str, _RefBinding] = {}
 
     def capture(self) -> BrowserSnapshot:
+        for attempt in range(2):
+            try:
+                return self._capture_once()
+            except _TransientCaptureError:
+                if attempt == 1:
+                    raise
+                self._page.wait_for_timeout(200)
+        raise AssertionError("unreachable capture retry state")
+
+    def _capture_once(self) -> BrowserSnapshot:
         started = time.perf_counter()
         self._remove_previous_markers()
         revision_before = _dom_revision(self._page)
@@ -212,7 +228,9 @@ class DomAxGrounder:
             )
             _, loader_after = _main_frame_identity(session)
             if loader_before != loader_after:
-                raise RuntimeError("document changed while capturing DOM and AX")
+                raise _TransientCaptureError(
+                    "document changed while capturing DOM and AX"
+                )
 
             dom_root = dom_result.get("root")
             ax_nodes = ax_result.get("nodes")
@@ -263,9 +281,13 @@ class DomAxGrounder:
 
             _, loader_final = _main_frame_identity(session)
             if loader_before != loader_final:
-                raise RuntimeError("document changed while publishing browser refs")
+                raise _TransientCaptureError(
+                    "document changed while publishing browser refs"
+                )
             if _dom_revision(self._page) != revision_before:
-                raise RuntimeError("document mutated while capturing DOM and AX")
+                raise _TransientCaptureError(
+                    "document mutated while capturing DOM and AX"
+                )
         except Exception:
             _remove_page_markers(self._page, marker_attribute)
             raise
