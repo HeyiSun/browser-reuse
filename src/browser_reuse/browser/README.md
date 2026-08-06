@@ -1,22 +1,33 @@
-# Adapters
+# Browser subsystem
 
-`browser.py` contains the first site-neutral browser action vocabulary proven by both the controlled Journey and public EasyAppointments task:
+This package contains the site-neutral browser integration. Each filename names
+one responsibility:
 
-- `Click`
-- `Fill`
-- `SelectOption`
-- CSS and accessible-role targets
-- mapping serialization and Playwright execution
+| Module | Responsibility |
+|---|---|
+| `actions.py` | `Click`, `Fill`, `SelectOption`, and the strict step codec |
+| `targets.py` | Locator candidates, witnesses, durable targets, and validation |
+| `dom_ax.py` | DOM+AX capture, snapshot refs, target building, and replay preflight |
+| `adapter.py` | `DomAxBrowserAdapter.observe()` and `execute()` |
+| `runtime.py` | Playwright and fresh browser-context ownership |
 
-`grounding.py` captures the main-document DOM and native accessibility tree,
-joins both through Chromium backend node identity, and creates snapshot-local
-refs. `generic.py` executes those exact live refs or strictly replays a single
-witnessed role/CSS target. Main-document open shadow DOM is supported; iframe,
-OOPIF, and closed-shadow controls fail closed in the current slice.
+The dependency direction stays simple:
 
-Snapshot refs and durable recipe targets are intentionally separate. A source
-action may be executable without being compilable, while fresh-context hard
-replay remains the test of whether a witnessed target is actually durable.
+```text
+targets ← actions
+   ↑         ↑
+ dom_ax ─────┘
+   ↑
+ adapter        runtime
+```
 
-Navigation bootstrap and verifier logic remain scenario-specific. Android
-implementations remain outside these browser types.
+`browser.__init__` exposes only the adapter and runtime. Callers that construct
+actions or targets import their defining module, so dependencies remain visible.
+
+Snapshot refs and durable recipe targets are separate. A source action may be
+executable without being compilable; fresh-context replay and the hard verifier
+decide whether a recipe can be published.
+
+The current grounder supports the main document and open shadow DOM. Iframes,
+OOPIFs, and closed shadow DOM fail closed. Navigation bootstrap, business tasks,
+and verifiers remain outside this package.

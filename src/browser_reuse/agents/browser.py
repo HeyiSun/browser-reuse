@@ -39,6 +39,8 @@ def run_generic_browser_agent(
     *,
     max_decisions: int = 35,
 ) -> AgentRun:
+    """Run the high-level DOM+AX Agent without exposing loop protocol hooks."""
+
     recent_actions: list[dict[str, object]] = []
     public_state_before_action: object = None
 

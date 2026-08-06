@@ -14,6 +14,8 @@ from .trajectory import ActionPlan, RecordedAction
 
 @dataclass(frozen=True)
 class AgentRun:
+    """Record one bounded Agent attempt and its successfully dispatched prefix."""
+
     claimed_success: bool
     actions: tuple[RecordedAction, ...]
     decisions: int
@@ -32,6 +34,14 @@ def run_agent_loop(
     max_decisions: int,
     allow_done_claim: bool = False,
 ) -> AgentRun:
+    """Run shared orchestration around a scenario-specific model protocol.
+
+    ``make_messages`` owns prompt and memory construction. ``parse_step`` owns
+    response validation and the live-action versus recipe-action distinction.
+    Keeping both outside the loop prevents orchestration from learning a site's
+    prompt grammar or browser schema.
+    """
+
     if max_decisions < 1:
         raise ValueError("max_decisions must be at least 1")
     actions: list[RecordedAction] = []

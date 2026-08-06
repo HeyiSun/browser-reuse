@@ -11,15 +11,17 @@ from browser_reuse.interfaces import ActionDispatchedError
 from .actions import (
     BrowserAction,
     Click,
-    DurableTarget,
     Fill,
     SelectOption,
     action_from_step,
     action_to_step,
 )
 from .dom_ax import DOM_REVISION_SCRIPT, DomAxGrounder
+from .targets import DurableTarget
 
 
+# Bounded settle policy: wait at most about eight seconds for two matching
+# network-and-DOM samples after at least three polls.
 _POLL_MS = 200
 _MIN_POLLS = 3
 _STABLE_MATCHES = 2
@@ -77,6 +79,7 @@ class DomAxBrowserAdapter:
     ) -> None:
         self._page = page
         self._grounder = grounder or DomAxGrounder(page)  # type: ignore[arg-type]
+        # Streaming requests never settle, so the callbacks exclude them.
         self._pending_requests: set[object] = set()
         on = getattr(page, "on", None)
         if callable(on):
@@ -85,6 +88,8 @@ class DomAxBrowserAdapter:
             on("requestfailed", self._request_finished)
 
     def observe(self) -> Observation:
+        """Return the model-readable snapshot plus ref execution metadata."""
+
         snapshot = self._grounder.capture()
         return Observation(
             data={
@@ -98,6 +103,13 @@ class DomAxBrowserAdapter:
         )
 
     def execute(self, step: Mapping[str, object]) -> Mapping[str, object] | None:
+        """Dispatch once, then wait for a bounded quiet state.
+
+        Live refs return ``None``. Durable replay returns the step pruned to the
+        locators confirmed in this capture. A settle error means the action may
+        already have happened.
+        """
+
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
         if isinstance(target, Mapping) and target.get("by") == "ref":
@@ -117,6 +129,8 @@ class DomAxBrowserAdapter:
         step: Mapping[str, object],
         target: Mapping[str, object],
     ) -> None:
+        """Execute a ref only against the snapshot that created it."""
+
         operation = step.get("op")
         expected = {
             "click": {"op", "target"},
@@ -144,6 +158,8 @@ class DomAxBrowserAdapter:
         self,
         step: Mapping[str, object],
     ) -> Mapping[str, object]:
+        """Preflight a witnessed target in a fresh capture, then execute it."""
+
         action = action_from_step(step)
         label = action.label if isinstance(action, SelectOption) else None
         locator, effective_target = self._grounder.resolve_durable_target(
@@ -155,6 +171,8 @@ class DomAxBrowserAdapter:
         return action_to_step(_action_with_target(action, effective_target))
 
     def _wait_until_stable(self) -> None:
+        """Wait for both non-streaming requests and DOM revisions to go quiet."""
+
         previous: tuple[str, str, int] | None = None
         stable_matches = 0
         for poll in range(_MAX_POLLS):
@@ -216,6 +234,8 @@ def _action_with_target(
     action: BrowserAction,
     target: DurableTarget,
 ) -> BrowserAction:
+    """Replace an action target with the candidates confirmed during replay."""
+
     if isinstance(action, Click):
         return Click(target)
     if isinstance(action, Fill):

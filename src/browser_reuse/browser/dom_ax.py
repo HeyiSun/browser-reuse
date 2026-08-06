@@ -10,20 +10,21 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from .actions import (
+from .actions import Click, action_to_step
+from .targets import (
     BrowserLocator,
-    Click,
     ContextFact,
     CssLocator,
     DurableTarget,
     ElementWitness,
     RoleLocator,
     XPathLocator,
-    action_to_step,
     looks_generated_id,
 )
 
 
+# A random marker connects a CDP backend node to a Playwright locator for one
+# snapshot only. The revision observer ignores these private marker mutations.
 REF_ATTRIBUTE_PREFIX = "data-browser-reuse-ref-"
 DOM_REVISION_SCRIPT = f"""() => {{
     const key = '__browserReuseDomRevisionV2';
@@ -64,6 +65,8 @@ DOM_REVISION_SCRIPT = f"""() => {{
     globalThis[key].scan(false);
     return {{ready: document.readyState, version: globalThis[key].version}};
 }}"""
+# The current action vocabulary is intentionally limited to roles proven by
+# existing tasks. Unsupported controls remain visible but receive no ref.
 _CLICK_ROLES = frozenset(
     {
         "button",
@@ -80,6 +83,7 @@ _FILL_ROLES = frozenset({"searchbox", "spinbutton", "textbox"})
 _STRUCTURAL_ROLES = frozenset(
     {"generic", "none", "inlinetextbox", "rootwebarea"}
 )
+# Attribute order is evidence priority, not a complete DOM attribute list.
 _TEST_ATTRIBUTES = (
     "data-testid",
     "data-test-id",
@@ -107,9 +111,11 @@ _CONTEXT_ANCESTOR_ROLES = frozenset(
         "tabpanel",
     }
 )
+# These budgets fail closed before an oversized snapshot reaches the model.
 _MAX_SELECT_OPTIONS = 40
 _MAX_CONTROLS = 200
 _MAX_SNAPSHOT_BYTES = 64_000
+# Secret hints only control conservative redaction; they never identify nodes.
 _SECRET_AUTOCOMPLETE = frozenset(
     {
         "current-password",
@@ -184,6 +190,8 @@ class _Page(Protocol):
 
 @dataclass(frozen=True)
 class BrowserSnapshot:
+    """One coherent model view plus its executable ref table and diagnostics."""
+
     text: str
     controls: Mapping[str, Mapping[str, object]]
     token: str
@@ -192,6 +200,8 @@ class BrowserSnapshot:
 
 @dataclass(frozen=True)
 class _DomNode:
+    """DOM facts indexed by Chromium backend node identity."""
+
     tag: str
     attributes: Mapping[str, str]
     closed_shadow: bool
@@ -201,6 +211,8 @@ class _DomNode:
 
 @dataclass(frozen=True)
 class _ContextEvidence:
+    """A named semantic ancestor or heading attached to its DOM evidence."""
+
     fact: ContextFact
     backend_id: int
     tag: str
@@ -209,6 +221,8 @@ class _ContextEvidence:
 
 @dataclass(frozen=True)
 class _ActionableNode:
+    """Joined DOM+AX facts for a control the current runtime can execute."""
+
     ref: str
     backend_id: int
     tag: str
@@ -223,6 +237,8 @@ class _ActionableNode:
 
 @dataclass(frozen=True)
 class _WitnessOption:
+    """One admitted fact that may help make a witness unique."""
+
     fact_id: str
     kind: str
     key: str
@@ -250,6 +266,8 @@ WitnessFactSelector = Callable[
 
 @dataclass(frozen=True)
 class _RefBinding:
+    """Capture-time identity used to reject semantic drift before execution."""
+
     marker: _Marker
     operation: str
     backend_id: int
@@ -262,12 +280,14 @@ class _RefBinding:
 
 @dataclass(frozen=True)
 class _Marker:
+    """A temporary DOM attribute/value pair bound to one snapshot."""
+
     attribute: str
     value: str
 
 
 class _TransientCaptureError(RuntimeError):
-    pass
+    """A page race that permits one whole-capture retry."""
 
 
 class DomAxGrounder:
@@ -281,6 +301,7 @@ class DomAxGrounder:
     ) -> None:
         self._page = page
         self._witness_fact_selector = witness_fact_selector
+        # All fields below belong to the latest capture and are replaced as a unit.
         self._token: str | None = None
         self._marker_attribute: str | None = None
         self._loader_id: str | None = None
@@ -288,9 +309,13 @@ class DomAxGrounder:
         self._actionable_nodes: tuple[_ActionableNode, ...] = ()
 
     def capture(self) -> BrowserSnapshot:
+        """Capture main-document and open-shadow DOM+AX with one transient retry."""
+
         return self._capture(include_targets=True)
 
     def _capture(self, *, include_targets: bool) -> BrowserSnapshot:
+        """Retry only when navigation or mutation tears the whole capture."""
+
         for attempt in range(2):
             try:
                 return self._capture_once(include_targets=include_targets)
@@ -301,6 +326,8 @@ class DomAxGrounder:
         raise AssertionError("unreachable capture retry state")
 
     def _capture_once(self, *, include_targets: bool) -> BrowserSnapshot:
+        """Build one loader- and revision-consistent snapshot."""
+
         started = time.perf_counter()
         self._remove_previous_markers()
         revision_before = _dom_revision(self._page)
@@ -360,6 +387,7 @@ class DomAxGrounder:
             lines: list[str] = []
             visited: set[str] = set()
             actionable_nodes: list[_ActionableNode] = []
+            # A one-item list shares the latest heading across recursive DFS calls.
             heading_state: list[_ContextEvidence | None] = [None]
             for root_id in roots:
                 self._render_ax_node(
@@ -434,6 +462,7 @@ class DomAxGrounder:
 
         bindings: dict[str, _RefBinding] = {}
         for ref, control in controls.items():
+            # Private staging fields build ref bindings, then leave public output.
             backend_id = control.pop("_backend_id", None)
             if not isinstance(backend_id, int):
                 raise RuntimeError("published browser ref lost its backend identity")
@@ -466,6 +495,8 @@ class DomAxGrounder:
         *,
         label: str | None = None,
     ) -> _Locator:
+        """Resolve a ref only if its loader, DOM node, semantics, and options match."""
+
         if (
             token != self._token
             or self._loader_id is None
@@ -538,6 +569,8 @@ class DomAxGrounder:
         depth: int,
         visited: set[str],
     ) -> None:
+        """Render one AX subtree while joining executable nodes to DOM evidence."""
+
         if node_id in visited:
             return
         visited.add(node_id)
@@ -666,6 +699,8 @@ class DomAxGrounder:
         actionable_nodes: list[_ActionableNode],
         contexts: tuple[_ContextEvidence, ...],
     ) -> tuple[str, str] | None:
+        """Publish one safe live ref, or leave the control non-executable."""
+
         role = _ax_text(ax_node.get("role")).lower()
         name = _ax_text(ax_node.get("name"))
         operation = _operation(role, dom_node.tag)
@@ -761,6 +796,8 @@ class DomAxGrounder:
         controls: dict[str, dict[str, object]],
         nodes: tuple[_ActionableNode, ...],
     ) -> None:
+        """Attach targets independently; a usable ref may remain non-compilable."""
+
         for node in nodes:
             try:
                 target = self._build_durable_target(
@@ -777,6 +814,8 @@ class DomAxGrounder:
         node: _ActionableNode,
         nodes: tuple[_ActionableNode, ...],
     ) -> DurableTarget | None:
+        """Build candidates that all confirm the source node through one witness."""
+
         witness = self._select_witness(node, nodes)
         if witness is None:
             return None
@@ -808,6 +847,8 @@ class DomAxGrounder:
         node: _ActionableNode,
         nodes: tuple[_ActionableNode, ...],
     ) -> ElementWitness | None:
+        """Select the smallest admitted fact set that uniquely identifies a node."""
+
         options = _witness_options(node)
         if self._witness_fact_selector is not None:
             try:
@@ -852,6 +893,8 @@ class DomAxGrounder:
         self,
         locator: BrowserLocator,
     ) -> tuple[int, ...]:
+        """Resolve one locator read-only to backend node identities."""
+
         if isinstance(locator, RoleLocator):
             return tuple(
                 node.backend_id
@@ -873,6 +916,8 @@ class DomAxGrounder:
         *,
         label: str | None = None,
     ) -> tuple[_Locator, DurableTarget]:
+        """Preflight every candidate on a fresh capture before returning one node."""
+
         snapshot = self._capture(include_targets=False)
         witness_matches = _matching_nodes(self._actionable_nodes, target.witness)
         if len(witness_matches) != 1:
@@ -907,6 +952,8 @@ class DomAxGrounder:
         return locator, DurableTarget(tuple(confirmed), target.witness)
 
     def _remove_previous_markers(self) -> None:
+        """Remove the previous snapshot's DOM markers and in-memory identity."""
+
         if self._marker_attribute is None:
             return
         _remove_page_markers(self._page, self._marker_attribute)
@@ -922,6 +969,8 @@ def _identity_attributes(
     *,
     exclude_textual: bool = False,
 ) -> dict[str, str]:
+    """Return only admitted identity facts, excluding generated ids."""
+
     excluded = {"name", "aria-label", "placeholder"} if exclude_textual else set()
     identity = {
         key: value
@@ -935,6 +984,8 @@ def _identity_attributes(
 
 
 def _name_contains_live_value(locator: _Locator, name: str) -> bool:
+    """Detect reflected secrets and redact conservatively on inspection errors."""
+
     if not name:
         return False
     try:
@@ -952,6 +1003,8 @@ def _name_contains_live_value(locator: _Locator, name: str) -> bool:
 
 
 def _witness_options(node: _ActionableNode) -> tuple[_WitnessOption, ...]:
+    """List facts in greedy priority order, with ordinary ids deliberately last."""
+
     options: list[_WitnessOption] = []
     for key in (*_TEST_ATTRIBUTES, "name", "aria-label"):
         if value := node.attributes.get(key):
@@ -994,6 +1047,8 @@ def _witness_from_options(
     node: _ActionableNode,
     options: Sequence[_WitnessOption],
 ) -> ElementWitness:
+    """Build a witness from selector-approved observed facts only."""
+
     attributes: list[tuple[str, str]] = []
     contexts: list[ContextFact] = []
     role: str | None = None
@@ -1019,6 +1074,8 @@ def _matching_nodes(
     nodes: Sequence[_ActionableNode],
     witness: ElementWitness,
 ) -> list[_ActionableNode]:
+    """Find all actionable nodes that satisfy every witness fact."""
+
     required_context = set(witness.context)
     return [
         node
@@ -1038,6 +1095,8 @@ def _candidate_locators(
     node: _ActionableNode,
     witness: ElementWitness,
 ) -> tuple[BrowserLocator, ...]:
+    """Generate CSS, role, anchored XPath, then absolute XPath candidates."""
+
     locators: list[BrowserLocator] = []
     for key in (*_TEST_ATTRIBUTES, "id", "name", "aria-label", "placeholder", "type"):
         value = node.attributes.get(key)
@@ -1077,6 +1136,8 @@ def _anchored_xpath(
     node: _ActionableNode,
     witness: ElementWitness,
 ) -> str | None:
+    """Anchor a node to one admitted context without fuzzy or class matching."""
+
     context_by_fact = {context.fact: context for context in node.contexts}
     selected_context = next(
         (
@@ -1117,6 +1178,8 @@ def _anchored_xpath(
 
 
 def _xpath_literal(value: str) -> str | None:
+    """Quote a plain XPath literal when one quote style is sufficient."""
+
     if any(character in value for character in "\r\n\x00"):
         return None
     if '"' not in value:
@@ -1127,6 +1190,8 @@ def _xpath_literal(value: str) -> str | None:
 
 
 def _locator_backend_ids(page: _Page, locator: _Locator) -> tuple[int, ...]:
+    """Mark locator matches, read their backend ids, and always remove the marker."""
+
     try:
         count = locator.count()
     except Exception:
@@ -1163,10 +1228,9 @@ def _locator_backend_ids(page: _Page, locator: _Locator) -> tuple[int, ...]:
     finally:
         _remove_page_markers(page, marker.attribute)
 
-
-
-
 def _main_frame_identity(session: _CdpSession) -> tuple[str, str]:
+    """Read the main frame and loader identities used to detect replacement."""
+
     result = session.send("Page.getFrameTree")
     frame_tree = result.get("frameTree")
     frame = frame_tree.get("frame") if isinstance(frame_tree, Mapping) else None
@@ -1178,6 +1242,8 @@ def _main_frame_identity(session: _CdpSession) -> tuple[str, str]:
 
 
 def _dom_revision(page: _Page) -> int:
+    """Read the lightweight mutation revision shared with the settle loop."""
+
     value = page.evaluate(DOM_REVISION_SCRIPT)
     if not isinstance(value, Mapping) or not isinstance(value.get("version"), int):
         raise RuntimeError("browser did not provide a DOM revision")
@@ -1185,6 +1251,8 @@ def _dom_revision(page: _Page) -> int:
 
 
 def _index_main_document(root: Mapping[str, object]) -> tuple[dict[int, _DomNode], int]:
+    """Index main DOM and open shadow roots without descending into iframes."""
+
     nodes: dict[int, _DomNode] = {}
     closed_roots = 0
 
@@ -1402,6 +1470,8 @@ def _backend_semantics(
     session: _CdpSession,
     backend_id: int,
 ) -> tuple[str, str, tuple[tuple[str, object], ...]] | None:
+    """Read current AX role, name, and state for one backend node."""
+
     result = session.send(
         "Accessibility.getPartialAXTree",
         {"backendNodeId": backend_id, "fetchRelatives": False},
@@ -1446,6 +1516,8 @@ def _mapping_sequence(value: object) -> tuple[Mapping[str, object], ...]:
 
 
 def _is_secret(attributes: Mapping[str, str], accessible_name: str) -> bool:
+    """Classify controls whose live values must stay out of observations."""
+
     if attributes.get("type", "").casefold() == "password":
         return True
     autocomplete = attributes.get("autocomplete", "").casefold().split()
@@ -1463,6 +1535,8 @@ def _is_secret(attributes: Mapping[str, str], accessible_name: str) -> bool:
 
 
 def _public_dom_state(attributes: Mapping[str, str]) -> dict[str, str]:
+    """Expose bounded UI state for decisions, never for durable identity."""
+
     state: dict[str, str] = {}
     for key in ("aria-pressed", "aria-selected", "aria-checked", "data-state"):
         value = attributes.get(key)

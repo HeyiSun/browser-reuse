@@ -36,7 +36,7 @@ def snapshot_step(step: Mapping[str, object]) -> dict[str, object]:
 
 
 def _reject_transient_browser_identity(step: Mapping[str, object]) -> None:
-    from browser_reuse.browser.actions import transient_identity_keys
+    from browser_reuse.browser.targets import transient_identity_keys
 
     forbidden_keys = transient_identity_keys()
 

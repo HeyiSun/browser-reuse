@@ -4,12 +4,16 @@ from __future__ import annotations
 
 
 class BrowserSession:
+    """Own one fresh browser context and page; closing is idempotent."""
+
     def __init__(self, context, page) -> None:
         self.context = context
         self.page = page
         self._closed = False
 
     def close(self) -> None:
+        """Close the owned context once."""
+
         if not self._closed:
             self.context.close()
             self._closed = True
@@ -23,12 +27,16 @@ class BrowserSession:
 
 
 class PlaywrightRuntime:
+    """Own Playwright and Chromium while creating isolated sessions."""
+
     def __init__(self, *, headless: bool = True) -> None:
         self._headless = headless
         self._playwright = None
         self._browser = None
 
     def start(self) -> PlaywrightRuntime:
+        """Start Chromium once and clean up Playwright if launch fails."""
+
         if self._browser is not None:
             return self
         self._playwright = _start_playwright()
@@ -47,6 +55,8 @@ class PlaywrightRuntime:
         locale: str = "en-US",
         default_timeout_ms: int = 2_000,
     ) -> BrowserSession:
+        """Create a fresh context and page with deterministic defaults."""
+
         if self._browser is None:
             raise RuntimeError("PlaywrightRuntime has not been started")
         context = self._browser.new_context(
@@ -63,6 +73,8 @@ class PlaywrightRuntime:
         return BrowserSession(context, page)
 
     def stop(self) -> None:
+        """Close Chromium, then Playwright, and allow repeated calls."""
+
         if self._browser is not None:
             self._browser.close()
             self._browser = None
@@ -79,6 +91,8 @@ class PlaywrightRuntime:
 
 
 def _start_playwright():
+    """Import Playwright lazily so it remains an optional runtime dependency."""
+
     from playwright.sync_api import sync_playwright
 
     return sync_playwright().start()
