@@ -1,14 +1,15 @@
-"""Typed, site-neutral browser actions and their Playwright execution."""
+"""Typed, site-neutral browser actions and durable target payloads."""
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 
 
-_STABLE_WITNESS_ATTRIBUTES = frozenset(
+_STABLE_ATTRIBUTES = frozenset(
     {
         "aria-label",
         "data-cy",
@@ -19,42 +20,155 @@ _STABLE_WITNESS_ATTRIBUTES = frozenset(
         "id",
         "name",
         "placeholder",
+        "type",
     }
 )
 _TAG_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
-_XPATH_PREFIX_PATTERN = re.compile(r"^(?:xpath\s*=|//|/|\.//|\(\s*//)", re.IGNORECASE)
-_POSITIONAL_SELECTOR_PATTERN = re.compile(
-    r":(?:nth(?:-child|-last-child|-of-type|-last-of-type)?\s*\(|"
-    r"first-child|last-child|only-child|first-of-type|last-of-type|only-of-type)",
+_ROLE_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
+_EXACT_ATTRIBUTE_SELECTOR_PATTERN = re.compile(
+    r"^(?P<tag>[a-z][a-z0-9-]*)?"
+    r"\[(?P<attribute>[a-z][a-z0-9-]*)=(?P<literal>\"(?:\\.|[^\"\\])*\")\]$"
+)
+_GENERATED_ID_PATTERNS = (
+    re.compile(r"^:", re.IGNORECASE),
+    re.compile(r":$", re.IGNORECASE),
+    re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE),
+    re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+        r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:^|[-_])\d{4,}(?:$|[-_])"),
+    re.compile(r"^[a-z][a-z0-9_-]*\d{3,}$", re.IGNORECASE),
+    re.compile(r"^(?:mantine|radix|headlessui|react)[-_:]", re.IGNORECASE),
+    re.compile(r"(?:^|[-_])(?:checkout|order|session)[-_][0-9a-f-]{8,}$", re.I),
+)
+_FORBIDDEN_XPATH_PATTERN = re.compile(
+    r"(?:contains\s*\(|@class\b|@value\b|@style\b|"
+    r"@(?:checked|selected|disabled)\b|"
+    r"@aria-(?:checked|selected|expanded|pressed|disabled)\b|"
+    r"@data-state\b|data-browser-reuse-ref-|\||"
+    r"\b(?:position|last)\s*\()",
     re.IGNORECASE,
 )
-_PLAYWRIGHT_ENGINE_PATTERN = re.compile(
-    r"^(?:text|role|id|internal:[a-z-]+|aria-ref)\s*=",
-    re.IGNORECASE,
+_ABSOLUTE_XPATH_PATTERN = re.compile(
+    r"^(?:/[a-z][a-z0-9-]*\[[1-9][0-9]*\])+$"
+)
+_HEADING_XPATH_PATTERN = re.compile(
+    r"^//(?P<anchor_tag>h[1-6])"
+    r"\[normalize-space\(\.\)=(?P<anchor_quote>['\"])"
+    r"(?P<anchor_value>.*?)(?P=anchor_quote)\]"
+    r"/following::(?P<leaf_tag>[a-z][a-z0-9-]*)"
+    r"(?:\[@(?P<leaf_attr>[a-z][a-z0-9-]*)="
+    r"(?P<leaf_quote>['\"])(?P<leaf_value>.*?)(?P=leaf_quote)\])?$"
+)
+_ANCESTOR_XPATH_PATTERN = re.compile(
+    r"^//(?P<anchor_tag>[a-z][a-z0-9-]*)"
+    r"\[@(?P<anchor_attr>aria-label|name)=(?P<anchor_quote>['\"])"
+    r"(?P<anchor_value>.*?)(?P=anchor_quote)\]"
+    r"//(?P<leaf_tag>[a-z][a-z0-9-]*)"
+    r"(?:\[@(?P<leaf_attr>[a-z][a-z0-9-]*)="
+    r"(?P<leaf_quote>['\"])(?P<leaf_value>.*?)(?P=leaf_quote)\])?$"
+)
+_TRANSIENT_KEYS = frozenset(
+    {
+        "backendNodeId",
+        "backendDOMNodeId",
+        "backend_node_id",
+        "backend_dom_node_id",
+        "cdpNodeId",
+        "cdp_node_id",
+        "loaderId",
+        "loader_id",
+        "nodeId",
+        "node_id",
+        "snapshot_token",
+    }
 )
 
 
 @dataclass(frozen=True)
+class RoleLocator:
+    role: str
+    name: str
+
+    def __post_init__(self) -> None:
+        _validate_role("role locator", self.role)
+        if not isinstance(self.name, str):
+            raise ValueError("role locator name must be a string")
+
+
+@dataclass(frozen=True)
+class CssLocator:
+    selector: str
+
+    def __post_init__(self) -> None:
+        _parse_exact_attribute_selector(self.selector)
+
+
+@dataclass(frozen=True)
+class XPathLocator:
+    expression: str
+    mode: Literal["anchored", "absolute"]
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"anchored", "absolute"}:
+            raise ValueError("xpath locator mode must be anchored or absolute")
+        if not isinstance(self.expression, str) or not self.expression:
+            raise ValueError("xpath locator expression must not be empty")
+        if self.expression != self.expression.strip():
+            raise ValueError("xpath locator must not contain outer whitespace")
+        if _FORBIDDEN_XPATH_PATTERN.search(self.expression):
+            raise ValueError("xpath locator contains forbidden identity or fallback syntax")
+        if self.mode == "absolute":
+            if not _ABSOLUTE_XPATH_PATTERN.fullmatch(self.expression):
+                raise ValueError("absolute xpath must be a canonical tag/index path")
+        elif _parse_anchored_xpath(self.expression) is None:
+            raise ValueError("anchored xpath is not a canonical generated shape")
+        _xpath_string_literals(self.expression)
+
+
+BrowserLocator: TypeAlias = RoleLocator | CssLocator | XPathLocator
+
+
+@dataclass(frozen=True)
+class ContextFact:
+    relation: Literal["ancestor", "nearest_heading"]
+    role: str
+    name: str
+
+    def __post_init__(self) -> None:
+        if self.relation not in {"ancestor", "nearest_heading"}:
+            raise ValueError("context relation must be ancestor or nearest_heading")
+        _validate_role("context", self.role)
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("context name must be a non-empty string")
+        if self.relation == "nearest_heading" and self.role != "heading":
+            raise ValueError("nearest_heading context must have the heading role")
+
+
+@dataclass(frozen=True)
 class ElementWitness:
-    """Stable public evidence used to reject a changed CSS target on replay."""
+    """Minimal public evidence that identifies a node independently of locators."""
 
     tag: str
     role: str | None = None
     name: str | None = None
     attributes: tuple[tuple[str, str], ...] = ()
+    context: tuple[ContextFact, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.tag, str) or not _TAG_PATTERN.fullmatch(self.tag):
             raise ValueError("witness tag must be a lowercase HTML tag")
-        _validate_optional_witness_text("role", self.role)
-        _validate_optional_witness_text("name", self.name)
-        if (self.role is None) != (self.name is None):
-            raise ValueError("witness role and name must be present together")
+        if self.role is not None:
+            _validate_role("witness", self.role)
+        if self.name is not None and not isinstance(self.name, str):
+            raise ValueError("witness name must be a string or null")
 
-        attributes: list[tuple[str, str]] = []
-        seen: set[str] = set()
         if not isinstance(self.attributes, tuple):
             raise ValueError("witness attributes must be a tuple of string pairs")
+        attributes: list[tuple[str, str]] = []
+        seen_attributes: set[str] = set()
         for item in self.attributes:
             if (
                 not isinstance(item, tuple)
@@ -65,39 +179,53 @@ class ElementWitness:
             ):
                 raise ValueError("witness attributes must contain non-empty string pairs")
             key, value = item
-            if key not in _STABLE_WITNESS_ATTRIBUTES:
-                raise ValueError(f"unsupported witness attribute: {key!r}")
-            if key in seen:
+            _validate_identity_attribute(key, value)
+            if key in seen_attributes:
                 raise ValueError(f"duplicate witness attribute: {key!r}")
-            seen.add(key)
+            seen_attributes.add(key)
             attributes.append((key, value))
+
+        if not isinstance(self.context, tuple) or not all(
+            isinstance(fact, ContextFact) for fact in self.context
+        ):
+            raise ValueError("witness context must be a tuple of context facts")
+        if len(set(self.context)) != len(self.context):
+            raise ValueError("witness context facts must not be duplicated")
+
         object.__setattr__(self, "attributes", tuple(sorted(attributes)))
 
 
 @dataclass(frozen=True)
-class CssTarget:
-    selector: str
+class DurableTarget:
+    locators: tuple[BrowserLocator, ...]
     witness: ElementWitness
 
     def __post_init__(self) -> None:
-        _validate_durable_css_selector(self.selector)
+        if (
+            not isinstance(self.locators, tuple)
+            or not 1 <= len(self.locators) <= 4
+            or not all(
+                isinstance(locator, (CssLocator, RoleLocator, XPathLocator))
+                for locator in self.locators
+            )
+        ):
+            raise ValueError("durable target requires one to four typed locators")
         if not isinstance(self.witness, ElementWitness):
-            raise ValueError("css target requires an element witness")
-        if not self.witness.attributes:
-            raise ValueError("css target witness requires a stable attribute")
+            raise ValueError("durable target requires an element witness")
+
+        ranks = tuple(_locator_rank(locator) for locator in self.locators)
+        if tuple(sorted(set(ranks))) != ranks:
+            raise ValueError("durable target locators must follow the canonical order")
+
+        allowed_literals = _witness_literals(self.witness)
+        for locator in self.locators:
+            if isinstance(locator, XPathLocator) and locator.mode == "anchored":
+                _validate_anchored_xpath_witness(locator, self.witness)
+                if not set(_xpath_string_literals(locator.expression)) <= allowed_literals:
+                    raise ValueError("anchored xpath contains evidence absent from its witness")
 
 
-@dataclass(frozen=True)
-class RoleTarget:
-    role: str
-    name: str
-
-    def __post_init__(self) -> None:
-        if not self.role or not self.name:
-            raise ValueError("role and name must not be empty")
-
-
-BrowserTarget: TypeAlias = CssTarget | RoleTarget
+BrowserTarget: TypeAlias = DurableTarget
 
 
 @dataclass(frozen=True)
@@ -126,7 +254,7 @@ class SelectOption:
 
     def __post_init__(self) -> None:
         _validate_target(self.target)
-        if not self.label:
+        if not isinstance(self.label, str) or not self.label:
             raise ValueError("select option label must not be empty")
 
 
@@ -144,18 +272,25 @@ class _Locator(Protocol):
 class _Page(Protocol):
     def locator(self, selector: str) -> _Locator: ...
 
-    def get_by_role(
-        self,
-        role: str,
-        *,
-        name: str,
-        exact: bool,
-    ) -> _Locator: ...
+    def get_by_role(self, role: str, *, name: str, exact: bool) -> _Locator: ...
 
 
 def execute_unchecked_browser_action(page: _Page, action: BrowserAction) -> None:
-    """Execute a trusted diagnostic action without replay witness checks."""
-    locator = _resolve(page, action.target)
+    """Execute a one-locator historical diagnostic without witness checks."""
+
+    if len(action.target.locators) != 1:
+        raise ValueError("unchecked execution requires exactly one locator")
+    candidate = action.target.locators[0]
+    if isinstance(candidate, CssLocator):
+        locator = page.locator(candidate.selector)
+    elif isinstance(candidate, RoleLocator):
+        locator = page.get_by_role(
+            candidate.role,
+            name=candidate.name,
+            exact=True,
+        )
+    else:
+        raise ValueError("unchecked execution does not support XPath locators")
     if isinstance(action, Click):
         locator.click()
     elif isinstance(action, Fill):
@@ -190,63 +325,73 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
         if not isinstance(value, str):
             raise ValueError("fill requires a string value")
         return Fill(target, value)
-    if operation == "select_option":
-        label = step.get("label")
-        if not isinstance(label, str) or not label:
-            raise ValueError("select_option requires a non-empty label")
-        return SelectOption(target, label)
-    raise ValueError(f"unknown browser action: {operation!r}")
+    label = step.get("label")
+    if not isinstance(label, str) or not label:
+        raise ValueError("select_option requires a non-empty label")
+    return SelectOption(target, label)
 
 
 def execute_unchecked_browser_step(page: _Page, step: Mapping[str, object]) -> None:
-    """Decode and execute a trusted diagnostic step without witness checks."""
+    """Decode a diagnostic step; durable execution remains deliberately checked."""
 
     execute_unchecked_browser_action(page, action_from_step(step))
 
 
-def _resolve(page: _Page, target: BrowserTarget) -> _Locator:
-    if isinstance(target, CssTarget):
-        return page.locator(target.selector)
-    return page.get_by_role(target.role, name=target.name, exact=True)
-
-
 def _validate_target(target: object) -> None:
-    if not isinstance(target, (CssTarget, RoleTarget)):
+    if not isinstance(target, DurableTarget):
         raise ValueError("browser action target has an unsupported type")
 
 
 def _target_to_mapping(target: BrowserTarget) -> dict[str, object]:
-    if isinstance(target, CssTarget):
-        return {
-            "by": "css",
-            "selector": target.selector,
-            "witness": _witness_to_mapping(target.witness),
-        }
-    return {"by": "role", "role": target.role, "name": target.name}
+    return {
+        "by": "durable",
+        "locators": [_locator_to_mapping(locator) for locator in target.locators],
+        "witness": _witness_to_mapping(target.witness),
+    }
 
 
 def _target_from_mapping(value: object) -> BrowserTarget:
     if not isinstance(value, Mapping):
         raise ValueError("browser action requires a target mapping")
+    if set(value) != {"by", "locators", "witness"} or value.get("by") != "durable":
+        raise ValueError("invalid durable target fields")
+    locators = value.get("locators")
+    if not isinstance(locators, list):
+        raise ValueError("durable target locators must be a list")
+    return DurableTarget(
+        tuple(_locator_from_mapping(locator) for locator in locators),
+        _witness_from_mapping(value.get("witness")),
+    )
+
+
+def _locator_to_mapping(locator: BrowserLocator) -> dict[str, object]:
+    if isinstance(locator, CssLocator):
+        return {"by": "css", "selector": locator.selector}
+    if isinstance(locator, RoleLocator):
+        return {"by": "role", "role": locator.role, "name": locator.name}
+    return {"by": "xpath", "mode": locator.mode, "expression": locator.expression}
+
+
+def _locator_from_mapping(value: object) -> BrowserLocator:
+    if not isinstance(value, Mapping):
+        raise ValueError("durable locator must be a mapping")
     strategy = value.get("by")
     if strategy == "css":
-        if set(value) != {"by", "selector", "witness"}:
-            raise ValueError("invalid css target fields")
-        selector = value.get("selector")
-        if not isinstance(selector, str) or not selector:
-            raise ValueError("css target requires a non-empty selector")
-        return CssTarget(selector, _witness_from_mapping(value.get("witness")))
+        if set(value) != {"by", "selector"}:
+            raise ValueError("invalid css locator fields")
+        return CssLocator(value.get("selector"))  # type: ignore[arg-type]
     if strategy == "role":
         if set(value) != {"by", "role", "name"}:
-            raise ValueError("invalid role target fields")
-        role = value.get("role")
-        name = value.get("name")
-        if not isinstance(role, str) or not role:
-            raise ValueError("role target requires a non-empty role")
-        if not isinstance(name, str) or not name:
-            raise ValueError("role target requires a non-empty name")
-        return RoleTarget(role, name)
-    raise ValueError(f"unknown target strategy: {strategy!r}")
+            raise ValueError("invalid role locator fields")
+        return RoleLocator(value.get("role"), value.get("name"))  # type: ignore[arg-type]
+    if strategy == "xpath":
+        if set(value) != {"by", "mode", "expression"}:
+            raise ValueError("invalid xpath locator fields")
+        return XPathLocator(  # type: ignore[arg-type]
+            expression=value.get("expression"),
+            mode=value.get("mode"),
+        )
+    raise ValueError(f"unknown locator strategy: {strategy!r}")
 
 
 def _witness_to_mapping(witness: ElementWitness) -> dict[str, object]:
@@ -255,19 +400,23 @@ def _witness_to_mapping(witness: ElementWitness) -> dict[str, object]:
         "role": witness.role,
         "name": witness.name,
         "attributes": dict(witness.attributes),
+        "context": [
+            {"relation": fact.relation, "role": fact.role, "name": fact.name}
+            for fact in witness.context
+        ],
     }
 
 
 def _witness_from_mapping(value: object) -> ElementWitness:
     if not isinstance(value, Mapping):
-        raise ValueError("css target requires a witness mapping")
-    if set(value) != {"tag", "role", "name", "attributes"}:
+        raise ValueError("durable target requires a witness mapping")
+    if set(value) != {"tag", "role", "name", "attributes", "context"}:
         raise ValueError("invalid witness fields")
-
     tag = value.get("tag")
     role = value.get("role")
     name = value.get("name")
     attributes = value.get("attributes")
+    context = value.get("context")
     if not isinstance(tag, str):
         raise ValueError("witness requires a tag")
     if role is not None and not isinstance(role, str):
@@ -276,59 +425,153 @@ def _witness_from_mapping(value: object) -> ElementWitness:
         raise ValueError("witness name must be a string or null")
     if not isinstance(attributes, Mapping):
         raise ValueError("witness attributes must be a mapping")
+    if not isinstance(context, list):
+        raise ValueError("witness context must be a list")
     pairs: list[tuple[str, str]] = []
     for key, attribute_value in attributes.items():
         if not isinstance(key, str) or not isinstance(attribute_value, str):
             raise ValueError("witness attributes must map strings to strings")
         pairs.append((key, attribute_value))
-    return ElementWitness(tag, role, name, tuple(pairs))
+    return ElementWitness(
+        tag,
+        role,
+        name,
+        tuple(pairs),
+        tuple(_context_from_mapping(fact) for fact in context),
+    )
 
 
-def _validate_optional_witness_text(field: str, value: object) -> None:
-    if value is not None and (not isinstance(value, str) or not value):
-        raise ValueError(f"witness {field} must be a non-empty string or null")
+def _context_from_mapping(value: object) -> ContextFact:
+    if not isinstance(value, Mapping) or set(value) != {"relation", "role", "name"}:
+        raise ValueError("invalid witness context fields")
+    return ContextFact(  # type: ignore[arg-type]
+        relation=value.get("relation"),
+        role=value.get("role"),
+        name=value.get("name"),
+    )
 
 
-def _validate_durable_css_selector(selector: object) -> None:
-    if not isinstance(selector, str) or not selector.strip():
-        raise ValueError("css selector must not be empty")
-    normalized = selector.strip()
-    if normalized != selector:
-        raise ValueError("css selector must not contain outer whitespace")
-    structure = _without_quoted_text(normalized)
-    if _XPATH_PREFIX_PATTERN.search(structure):
-        raise ValueError("XPath is not a durable CSS selector")
-    if _PLAYWRIGHT_ENGINE_PATTERN.search(structure):
-        raise ValueError("Playwright selector engines are not durable CSS")
-    if "data-browser-reuse-ref-" in normalized:
-        raise ValueError("snapshot marker selectors are not durable")
-    if ">>" in structure:
-        raise ValueError("chained Playwright selectors are not durable")
-    if "," in structure:
-        raise ValueError("CSS selector lists are not durable")
-    if _POSITIONAL_SELECTOR_PATTERN.search(structure):
-        raise ValueError("positional CSS selectors are not durable")
+def _validate_role(owner: str, role: object) -> None:
+    if not isinstance(role, str) or not _ROLE_PATTERN.fullmatch(role):
+        raise ValueError(f"{owner} role must be a lowercase non-empty role")
 
 
-def _without_quoted_text(selector: str) -> str:
-    output: list[str] = []
-    quote: str | None = None
-    escaped = False
-    for character in selector:
-        if quote is not None:
-            output.append(" ")
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
+def _validate_identity_attribute(key: str, value: str) -> None:
+    if key not in _STABLE_ATTRIBUTES:
+        raise ValueError(f"unsupported witness attribute: {key!r}")
+    if key == "id" and looks_generated_id(value):
+        raise ValueError("generated ids cannot enter a durable target")
+
+
+def _parse_exact_attribute_selector(selector: object) -> tuple[str | None, str, str]:
+    if not isinstance(selector, str):
+        raise ValueError("css locator selector must be a string")
+    match = _EXACT_ATTRIBUTE_SELECTOR_PATTERN.fullmatch(selector)
+    if match is None:
+        raise ValueError("css locator must be one canonical exact attribute selector")
+    attribute = match.group("attribute")
+    try:
+        value = json.loads(match.group("literal"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("css locator contains an invalid attribute string") from exc
+    if not isinstance(value, str) or not value:
+        raise ValueError("css locator attribute value must not be empty")
+    _validate_identity_attribute(attribute, value)
+    canonical = (
+        f"{match.group('tag') or ''}[{attribute}="
+        f"{json.dumps(value, ensure_ascii=False)}]"
+    )
+    if selector != canonical:
+        raise ValueError("css locator must use canonical JSON string quoting")
+    return match.group("tag"), attribute, value
+
+
+def looks_generated_id(value: str) -> bool:
+    return any(pattern.search(value) for pattern in _GENERATED_ID_PATTERNS)
+
+
+def _locator_rank(locator: BrowserLocator) -> int:
+    if isinstance(locator, CssLocator):
+        return 0
+    if isinstance(locator, RoleLocator):
+        return 1
+    return 2 if locator.mode == "anchored" else 3
+
+
+def _witness_literals(witness: ElementWitness) -> set[str]:
+    values = {value for _, value in witness.attributes}
+    if witness.role is not None:
+        values.add(witness.role)
+    if witness.name is not None:
+        values.add(witness.name)
+    for fact in witness.context:
+        values.update((fact.role, fact.name))
+    return values
+
+
+def _parse_anchored_xpath(expression: str) -> dict[str, str | None] | None:
+    for relation, pattern in (
+        ("nearest_heading", _HEADING_XPATH_PATTERN),
+        ("ancestor", _ANCESTOR_XPATH_PATTERN),
+    ):
+        match = pattern.fullmatch(expression)
+        if match is None:
             continue
-        if character in {'"', "'"}:
-            quote = character
-            output.append(" ")
-        else:
-            output.append(character)
-    if quote is not None:
-        raise ValueError("css selector contains an unterminated string")
-    return "".join(output)
+        values = match.groupdict()
+        leaf_attr = values.get("leaf_attr")
+        leaf_value = values.get("leaf_value")
+        if leaf_attr is not None and leaf_value is not None:
+            _validate_identity_attribute(leaf_attr, leaf_value)
+        return {
+            "relation": relation,
+            "anchor_value": values["anchor_value"],
+            "leaf_tag": values["leaf_tag"],
+            "leaf_attr": leaf_attr,
+            "leaf_value": leaf_value,
+        }
+    return None
+
+
+def _validate_anchored_xpath_witness(
+    locator: XPathLocator,
+    witness: ElementWitness,
+) -> None:
+    parsed = _parse_anchored_xpath(locator.expression)
+    if parsed is None or parsed["leaf_tag"] != witness.tag:
+        raise ValueError("anchored xpath leaf differs from its witness")
+    if not any(
+        fact.relation == parsed["relation"]
+        and fact.name == parsed["anchor_value"]
+        for fact in witness.context
+    ):
+        raise ValueError("anchored xpath anchor differs from its witness context")
+    leaf_attr = parsed["leaf_attr"]
+    leaf_value = parsed["leaf_value"]
+    if (
+        leaf_attr is not None
+        and leaf_value is not None
+        and (leaf_attr, leaf_value) not in witness.attributes
+    ):
+        raise ValueError("anchored xpath leaf evidence differs from its witness")
+
+
+def _xpath_string_literals(expression: str) -> tuple[str, ...]:
+    literals: list[str] = []
+    index = 0
+    while index < len(expression):
+        quote = expression[index]
+        if quote not in {"'", '"'}:
+            index += 1
+            continue
+        end = expression.find(quote, index + 1)
+        if end < 0:
+            raise ValueError("xpath locator contains an unterminated string")
+        literals.append(expression[index + 1 : end])
+        index = end + 1
+    return tuple(literals)
+
+
+def transient_identity_keys() -> frozenset[str]:
+    """Return the codec-level denylist used by recipe serialization."""
+
+    return _TRANSIENT_KEYS

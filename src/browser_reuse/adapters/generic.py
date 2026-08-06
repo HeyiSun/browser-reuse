@@ -10,12 +10,14 @@ from browser_reuse.interfaces import ActionDispatchedError
 
 from .browser import (
     BrowserAction,
-    CssTarget,
+    Click,
+    DurableTarget,
     Fill,
     SelectOption,
     action_from_step,
+    action_to_step,
 )
-from .grounding import DOM_REVISION_SCRIPT, DomAxGrounder, witness_matches
+from .grounding import DOM_REVISION_SCRIPT, DomAxGrounder
 
 
 _POLL_MS = 200
@@ -95,18 +97,20 @@ class GenericBrowserAdapter:
             }
         )
 
-    def execute(self, step: Mapping[str, object]) -> None:
+    def execute(self, step: Mapping[str, object]) -> Mapping[str, object] | None:
         target = step.get("target")
+        effective_step: Mapping[str, object] | None = None
         if isinstance(target, Mapping) and target.get("by") == "ref":
             self._execute_ref_step(step, target)
         else:
-            self._execute_durable_step(step)
+            effective_step = self._execute_durable_step(step)
         try:
             self._wait_until_stable()
         except Exception as exc:
             raise ActionDispatchedError(
                 "browser action was dispatched but the page did not settle"
             ) from exc
+        return effective_step
 
     def _execute_ref_step(
         self,
@@ -136,40 +140,19 @@ class GenericBrowserAdapter:
         )
         _execute_locator(locator, operation, step)
 
-    def _execute_durable_step(self, step: Mapping[str, object]) -> None:
-        action = action_from_step(step)
-        locator = self._resolve(action)
-        if locator.count() != 1:
-            raise ValueError("browser target is no longer unique")
-        if isinstance(action.target, CssTarget):
-            if not witness_matches(locator, action.target.witness):
-                raise ValueError("browser target no longer matches its witness")
-            if not self._semantic_witness_matches(locator, action.target):
-                raise ValueError("browser target semantic witness changed")
-        if not locator.is_visible() or not locator.is_enabled():
-            raise ValueError("browser target is no longer actionable")
-        if isinstance(action, Fill) and not locator.is_editable():
-            raise ValueError("browser fill target is no longer editable")
-        if isinstance(action, SelectOption):
-            _validate_select_label(locator, action.label)
-        _execute_locator(locator, step.get("op"), step)
-
-    def _resolve(self, action: BrowserAction) -> _Locator:
-        target = action.target
-        if isinstance(target, CssTarget):
-            return self._page.locator(target.selector)
-        return self._page.get_by_role(
-            target.role,
-            name=target.name,
-            exact=True,
-        )
-
-    def _semantic_witness_matches(
+    def _execute_durable_step(
         self,
-        locator: _Locator,
-        target: CssTarget,
-    ) -> bool:
-        return self._grounder.semantic_witness_matches(locator, target.witness)
+        step: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        action = action_from_step(step)
+        label = action.label if isinstance(action, SelectOption) else None
+        locator, effective_target = self._grounder.resolve_durable_target(
+            action.target,
+            step.get("op", ""),
+            label=label,
+        )
+        _execute_locator(locator, step.get("op"), step)
+        return action_to_step(_action_with_target(action, effective_target))
 
     def _wait_until_stable(self) -> None:
         previous: tuple[str, str, int] | None = None
@@ -229,11 +212,12 @@ def _execute_locator(
     raise ValueError(f"unknown browser action: {operation!r}")
 
 
-def _validate_select_label(locator: _Locator, label: str) -> None:
-    labels = locator.evaluate(
-        """element => Array.from(element.options)
-            .filter(option => !option.disabled && !option.hidden && option.value)
-            .map(option => option.textContent.trim())"""
-    )
-    if not isinstance(labels, list) or labels.count(label) != 1:
-        raise ValueError("select option label is no longer unique")
+def _action_with_target(
+    action: BrowserAction,
+    target: DurableTarget,
+) -> BrowserAction:
+    if isinstance(action, Click):
+        return Click(target)
+    if isinstance(action, Fill):
+        return Fill(target, action.value)
+    return SelectOption(target, action.label)

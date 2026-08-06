@@ -14,7 +14,12 @@ class Adapter(Protocol):
     def observe(self) -> Observation:
         ...
 
-    def execute(self, step: Mapping[str, object]) -> None:
+    def execute(
+        self,
+        step: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        """Execute one step and optionally return the canonical effective step."""
+
         ...
 
 

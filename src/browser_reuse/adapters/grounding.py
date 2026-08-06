@@ -6,18 +6,29 @@ import json
 import re
 import secrets
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from .browser import Click, CssTarget, ElementWitness, RoleTarget, action_to_step
+from .browser import (
+    BrowserLocator,
+    Click,
+    ContextFact,
+    CssLocator,
+    DurableTarget,
+    ElementWitness,
+    RoleLocator,
+    XPathLocator,
+    action_to_step,
+    looks_generated_id,
+)
 
 
 REF_ATTRIBUTE_PREFIX = "data-browser-reuse-ref-"
 DOM_REVISION_SCRIPT = f"""() => {{
-    const key = '__browser_reuseDomRevisionV1';
+    const key = '__browserReuseDomRevisionV2';
     if (!globalThis[key]) {{
-        const state = {{version: 0}};
+        const state = {{version: 0, roots: new WeakSet()}};
         const observer = new MutationObserver((mutations) => {{
             if (mutations.some(mutation => !(
                 mutation.type === 'attributes' &&
@@ -25,17 +36,32 @@ DOM_REVISION_SCRIPT = f"""() => {{
             ))) {{
                 state.version += 1;
             }}
+            scan(false);
         }});
-        if (document.documentElement) {{
-            observer.observe(document.documentElement, {{
+        const observe = (root, initial) => {{
+            if (!root || state.roots.has(root)) return;
+            state.roots.add(root);
+            observer.observe(root, {{
                 attributes: true,
                 childList: true,
                 characterData: true,
                 subtree: true,
             }});
-        }}
+            if (!initial) state.version += 1;
+        }};
+        const scanRoot = (root, initial) => {{
+            observe(root, initial);
+            if (!root) return;
+            for (const element of root.querySelectorAll('*')) {{
+                if (element.shadowRoot) scanRoot(element.shadowRoot, initial);
+            }}
+        }};
+        const scan = (initial) => scanRoot(document.documentElement, initial);
+        state.scan = scan;
         globalThis[key] = state;
+        scan(true);
     }}
+    globalThis[key].scan(false);
     return {{ready: document.readyState, version: globalThis[key].version}};
 }}"""
 _CLICK_ROLES = frozenset(
@@ -61,22 +87,29 @@ _TEST_ATTRIBUTES = (
     "data-qa",
     "data-cy",
 )
+_IDENTITY_ATTRIBUTES = (
+    *_TEST_ATTRIBUTES,
+    "name",
+    "aria-label",
+    "placeholder",
+    "type",
+)
+_CONTEXT_ANCESTOR_ROLES = frozenset(
+    {
+        "article",
+        "dialog",
+        "form",
+        "group",
+        "listitem",
+        "region",
+        "row",
+        "table",
+        "tabpanel",
+    }
+)
 _MAX_SELECT_OPTIONS = 40
 _MAX_CONTROLS = 200
 _MAX_SNAPSHOT_BYTES = 64_000
-_GENERATED_ID_PATTERNS = (
-    re.compile(r"^:", re.IGNORECASE),
-    re.compile(r":$", re.IGNORECASE),
-    re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE),
-    re.compile(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
-        r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:^|[-_])\d{4,}(?:$|[-_])"),
-    re.compile(r"^[a-z][a-z0-9_-]*\d{3,}$", re.IGNORECASE),
-    re.compile(r"^(?:mantine|radix|headlessui|react)[-_:]", re.IGNORECASE),
-)
 _SECRET_AUTOCOMPLETE = frozenset(
     {
         "current-password",
@@ -115,7 +148,7 @@ class _BrowserContext(Protocol):
 class _Locator(Protocol):
     def count(self) -> int: ...
 
-    def evaluate(self, expression: str): ...
+    def evaluate(self, expression: str, arg: object | None = None): ...
 
     def evaluate_all(self, expression: str, arg: object | None = None): ...
 
@@ -162,6 +195,57 @@ class _DomNode:
     tag: str
     attributes: Mapping[str, str]
     closed_shadow: bool
+    in_shadow: bool
+    absolute_xpath: str | None
+
+
+@dataclass(frozen=True)
+class _ContextEvidence:
+    fact: ContextFact
+    backend_id: int
+    tag: str
+    attributes: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class _ActionableNode:
+    ref: str
+    backend_id: int
+    tag: str
+    attributes: Mapping[str, str]
+    role: str
+    name: str
+    operation: str
+    contexts: tuple[_ContextEvidence, ...]
+    in_shadow: bool
+    absolute_xpath: str | None
+
+
+@dataclass(frozen=True)
+class _WitnessOption:
+    fact_id: str
+    kind: str
+    key: str
+    value: str
+    context: ContextFact | None = None
+
+    def public(self) -> Mapping[str, str]:
+        value = {
+            "fact_id": self.fact_id,
+            "kind": self.kind,
+            "key": self.key,
+            "value": self.value,
+        }
+        if self.context is not None:
+            value["relation"] = self.context.relation
+            value["role"] = self.context.role
+        return value
+
+
+WitnessFactSelector = Callable[
+    [tuple[Mapping[str, str], ...]],
+    Sequence[str],
+]
 
 
 @dataclass(frozen=True)
@@ -189,24 +273,35 @@ class _TransientCaptureError(RuntimeError):
 class DomAxGrounder:
     """Capture one main-document DOM+AX view and bind refs to exact live nodes."""
 
-    def __init__(self, page: _Page) -> None:
+    def __init__(
+        self,
+        page: _Page,
+        *,
+        witness_fact_selector: WitnessFactSelector | None = None,
+    ) -> None:
         self._page = page
+        self._witness_fact_selector = witness_fact_selector
         self._token: str | None = None
         self._marker_attribute: str | None = None
         self._loader_id: str | None = None
+        self._dom_revision: int | None = None
         self._bindings: dict[str, _RefBinding] = {}
+        self._actionable_nodes: tuple[_ActionableNode, ...] = ()
 
     def capture(self) -> BrowserSnapshot:
+        return self._capture(include_targets=True)
+
+    def _capture(self, *, include_targets: bool) -> BrowserSnapshot:
         for attempt in range(2):
             try:
-                return self._capture_once()
+                return self._capture_once(include_targets=include_targets)
             except _TransientCaptureError:
                 if attempt == 1:
                     raise
                 self._page.wait_for_timeout(200)
         raise AssertionError("unreachable capture retry state")
 
-    def _capture_once(self) -> BrowserSnapshot:
+    def _capture_once(self, *, include_targets: bool) -> BrowserSnapshot:
         started = time.perf_counter()
         self._remove_previous_markers()
         revision_before = _dom_revision(self._page)
@@ -265,6 +360,8 @@ class DomAxGrounder:
 
             lines: list[str] = []
             visited: set[str] = set()
+            actionable_nodes: list[_ActionableNode] = []
+            heading_state: list[_ContextEvidence | None] = [None]
             for root_id in roots:
                 self._render_ax_node(
                     root_id,
@@ -275,6 +372,9 @@ class DomAxGrounder:
                     controls,
                     diagnostics,
                     lines,
+                    actionable_nodes,
+                    heading_state,
+                    ancestor_contexts=(),
                     depth=0,
                     visited=visited,
                 )
@@ -293,6 +393,32 @@ class DomAxGrounder:
             raise
         finally:
             session.detach()
+
+        frozen_actionable_nodes = tuple(actionable_nodes)
+        self._actionable_nodes = frozen_actionable_nodes
+        if include_targets:
+            try:
+                self._attach_durable_targets(
+                    controls,
+                    frozen_actionable_nodes,
+                )
+                verification = self._page.context.new_cdp_session(self._page)
+                try:
+                    verification.send("Page.enable")
+                    _, loader_after_targets = _main_frame_identity(verification)
+                finally:
+                    verification.detach()
+                if loader_after_targets != loader_before:
+                    raise _TransientCaptureError(
+                        "document changed while compiling durable targets"
+                    )
+                if _dom_revision(self._page) != revision_before:
+                    raise _TransientCaptureError(
+                        "document mutated while compiling durable targets"
+                    )
+            except Exception:
+                _remove_page_markers(self._page, marker_attribute)
+                raise
 
         diagnostics["actionable_refs"] = len(controls)
         diagnostics["durable_targets"] = sum(
@@ -329,6 +455,7 @@ class DomAxGrounder:
         self._token = token
         self._marker_attribute = marker_attribute
         self._loader_id = loader_before
+        self._dom_revision = revision_before
         self._bindings = bindings
         return BrowserSnapshot(
             text=text,
@@ -345,7 +472,11 @@ class DomAxGrounder:
         *,
         label: str | None = None,
     ) -> _Locator:
-        if token != self._token or self._loader_id is None:
+        if (
+            token != self._token
+            or self._loader_id is None
+            or self._dom_revision is None
+        ):
             raise ValueError("browser ref belongs to a stale observation")
         binding = self._bindings.get(ref)
         if binding is None or binding.operation != operation:
@@ -376,6 +507,8 @@ class DomAxGrounder:
             session.detach()
         if loader_id != self._loader_id:
             raise ValueError("browser ref belongs to a replaced document")
+        if _dom_revision(self._page) != self._dom_revision:
+            raise ValueError("browser ref belongs to a mutated observation")
         if live_backend_ids != (binding.backend_id,):
             raise ValueError("browser ref no longer resolves to its live node")
         live_dom = live_dom_nodes.get(binding.backend_id)
@@ -397,51 +530,6 @@ class DomAxGrounder:
                 raise ValueError("browser select options changed after observation")
         return locator
 
-    def semantic_witness_matches(
-        self,
-        locator: _Locator,
-        witness: ElementWitness,
-    ) -> bool:
-        if witness.role is None or witness.name is None:
-            return True
-        attribute = f"{REF_ATTRIBUTE_PREFIX}verify-{secrets.token_hex(8)}"
-        marker = _Marker(attribute, "target")
-        try:
-            locator.evaluate(
-                "(element, marker) => element.setAttribute(marker.name, marker.value)",
-                {"name": marker.attribute, "value": marker.value},
-            )
-            session = self._page.context.new_cdp_session(self._page)
-            try:
-                session.send("DOM.enable")
-                session.send("Accessibility.enable")
-                dom_result = session.send(
-                    "DOM.getDocument",
-                    {"depth": -1, "pierce": True},
-                )
-                dom_root = dom_result.get("root")
-                backend_ids = (
-                    _backend_ids_with_marker(dom_root, marker)
-                    if isinstance(dom_root, Mapping)
-                    else ()
-                )
-                if len(backend_ids) != 1:
-                    return False
-                semantics = _backend_semantics(session, backend_ids[0])
-            finally:
-                session.detach()
-            return semantics[0:2] == (witness.role, witness.name)
-        except Exception:
-            return False
-        finally:
-            try:
-                locator.evaluate(
-                    "(element, name) => element.removeAttribute(name)",
-                    marker.attribute,
-                )
-            except Exception:
-                pass
-
     def _render_ax_node(
         self,
         node_id: str,
@@ -452,7 +540,10 @@ class DomAxGrounder:
         controls: dict[str, dict[str, object]],
         diagnostics: dict[str, object],
         lines: list[str],
+        actionable_nodes: list[_ActionableNode],
+        heading_state: list[_ContextEvidence | None],
         *,
+        ancestor_contexts: tuple[_ContextEvidence, ...],
         depth: int,
         visited: set[str],
     ) -> None:
@@ -483,26 +574,60 @@ class DomAxGrounder:
                     int(diagnostics["joined_ax_nodes"]) + 1
                 )
 
+        nearest_heading = heading_state[0]
+        contexts = tuple(reversed(ancestor_contexts))
+        if nearest_heading is not None:
+            contexts = (*contexts, nearest_heading)
+
         ref: str | None = None
+        display_name = name
         if dom_node is not None and not _ax_ignored(node):
-            ref = self._publish_control(
+            published = self._publish_control(
                 node,
                 dom_node,
                 int(backend_id),
                 session,
                 marker_attribute,
                 controls,
+                actionable_nodes,
+                contexts,
             )
+            if published is not None:
+                ref, display_name = published
+
+        current_context: _ContextEvidence | None = None
+        if (
+            dom_node is not None
+            and isinstance(backend_id, int)
+            and name
+            and not _ax_ignored(node)
+        ):
+            if role == "heading":
+                heading_state[0] = _ContextEvidence(
+                    ContextFact("nearest_heading", "heading", name),
+                    backend_id,
+                    dom_node.tag,
+                    dom_node.attributes,
+                )
+            if role in _CONTEXT_ANCESTOR_ROLES:
+                current_context = _ContextEvidence(
+                    ContextFact("ancestor", role, name),
+                    backend_id,
+                    dom_node.tag,
+                    dom_node.attributes,
+                )
 
         child_ids = [str(value) for value in _sequence(node.get("childIds"))]
         if dom_node is not None and _is_secret(dom_node.attributes, name):
             child_ids = []
-        show = bool(role and (name or ref or role not in _STRUCTURAL_ROLES))
+        show = bool(
+            role and (display_name or ref or role not in _STRUCTURAL_ROLES)
+        )
         child_depth = depth + 1 if show else depth
         if show:
             line = "  " * depth + f"- {role}"
-            if name:
-                line += f" {json.dumps(name, ensure_ascii=False)}"
+            if display_name:
+                line += f" {json.dumps(display_name, ensure_ascii=False)}"
             for state in ("checked", "selected", "expanded", "disabled"):
                 value = _ax_property(node, state)
                 if value is True:
@@ -528,6 +653,13 @@ class DomAxGrounder:
                 controls,
                 diagnostics,
                 lines,
+                actionable_nodes,
+                heading_state,
+                ancestor_contexts=(
+                    (*ancestor_contexts, current_context)
+                    if current_context is not None
+                    else ancestor_contexts
+                ),
                 depth=child_depth,
                 visited=visited,
             )
@@ -540,7 +672,9 @@ class DomAxGrounder:
         session: _CdpSession,
         marker_attribute: str,
         controls: dict[str, dict[str, object]],
-    ) -> str | None:
+        actionable_nodes: list[_ActionableNode],
+        contexts: tuple[_ContextEvidence, ...],
+    ) -> tuple[str, str] | None:
         role = _ax_text(ax_node.get("role")).lower()
         name = _ax_text(ax_node.get("name"))
         operation = _operation(role, dom_node.tag)
@@ -554,6 +688,7 @@ class DomAxGrounder:
         ):
             return None
 
+        secret = _is_secret(dom_node.attributes, name)
         ref = f"e{len(controls)}"
         marker = _Marker(marker_attribute, ref)
         if not _set_marker(session, backend_id, marker):
@@ -568,14 +703,17 @@ class DomAxGrounder:
             _remove_marker(session, backend_id, marker)
             return None
 
-        control: dict[str, object] = {"op": operation, "name": name}
+        public_name = (
+            "" if secret and _name_contains_live_value(locator, name) else name
+        )
+        control: dict[str, object] = {"op": operation, "name": public_name}
         public_state = _public_dom_state(dom_node.attributes)
         if public_state:
             control["state"] = public_state
-        if operation == "fill" and not _is_secret(dom_node.attributes, name):
+        if operation == "fill" and not secret:
             control["value"] = locator.input_value()
         elif operation == "select_option":
-            if _is_secret(dom_node.attributes, name):
+            if secret:
                 _remove_marker(session, backend_id, marker)
                 return None
             state = locator.evaluate(
@@ -602,106 +740,180 @@ class DomAxGrounder:
             control["value"] = str(state.get("value", ""))
             control["labels"] = labels
 
-        target = self._durable_target(
-            marker,
-            dom_node,
-            role,
-            name,
+        actionable_nodes.append(
+            _ActionableNode(
+                ref=ref,
+                backend_id=backend_id,
+                tag=dom_node.tag,
+                attributes=_identity_attributes(
+                    dom_node.attributes,
+                    exclude_textual=secret,
+                ),
+                role=role,
+                name=public_name,
+                operation=operation,
+                contexts=contexts,
+                in_shadow=dom_node.in_shadow,
+                absolute_xpath=dom_node.absolute_xpath,
+            )
         )
-        if target is not None:
-            control["target"] = action_to_step(Click(target))["target"]
         control["_backend_id"] = backend_id
         control["_tag"] = dom_node.tag
         control["_role"] = role
         control["_name"] = name
         control["_state"] = _semantic_state(ax_node)
         controls[ref] = control
-        return ref
+        return ref, public_name
 
-    def _durable_target(
+    def _attach_durable_targets(
         self,
-        marker: _Marker,
-        dom_node: _DomNode,
-        role: str,
-        name: str,
-    ) -> CssTarget | RoleTarget | None:
-        attributes = dom_node.attributes
-
-        for attribute in _TEST_ATTRIBUTES:
-            value = attributes.get(attribute)
-            target = self._attribute_target(
-                dom_node,
-                role,
-                name,
-                marker,
-                attribute,
-                value,
-                include_tag=False,
-            )
+        controls: dict[str, dict[str, object]],
+        nodes: tuple[_ActionableNode, ...],
+    ) -> None:
+        for node in nodes:
+            try:
+                target = self._build_durable_target(
+                    node,
+                    nodes,
+                )
+            except (RuntimeError, ValueError):
+                target = None
             if target is not None:
-                return target
+                controls[node.ref]["target"] = action_to_step(Click(target))["target"]
 
-        element_id = attributes.get("id")
-        if element_id and not looks_generated_id(element_id):
-            target = self._attribute_target(
-                dom_node,
-                role,
-                name,
-                marker,
-                "id",
-                element_id,
-                include_tag=False,
+    def _build_durable_target(
+        self,
+        node: _ActionableNode,
+        nodes: tuple[_ActionableNode, ...],
+    ) -> DurableTarget | None:
+        witness = self._select_witness(node, nodes)
+        if witness is None:
+            return None
+        witness_matches = _matching_nodes(nodes, witness)
+        if [match.backend_id for match in witness_matches] != [node.backend_id]:
+            return None
+
+        admitted: list[BrowserLocator] = []
+        admitted_slots: set[str] = set()
+        for locator in _candidate_locators(node, witness):
+            slot = _locator_slot(locator)
+            if slot in admitted_slots:
+                continue
+            raw_backend_ids = self._resolve_locator_backend_ids(locator)
+            confirmed = {
+                match.backend_id
+                for match in witness_matches
+                if match.backend_id in raw_backend_ids
+            }
+            if confirmed == {node.backend_id}:
+                admitted.append(locator)
+                admitted_slots.add(slot)
+        if not admitted:
+            return None
+        return DurableTarget(tuple(admitted), witness)
+
+    def _select_witness(
+        self,
+        node: _ActionableNode,
+        nodes: tuple[_ActionableNode, ...],
+    ) -> ElementWitness | None:
+        options = _witness_options(node)
+        if self._witness_fact_selector is not None:
+            try:
+                selected = self._witness_fact_selector(
+                    tuple(option.public() for option in options)
+                )
+                if isinstance(selected, str):
+                    return None
+                selected_ids = tuple(selected)
+            except Exception:
+                return None
+            if not all(isinstance(fact_id, str) for fact_id in selected_ids):
+                return None
+            if not selected_ids or len(selected_ids) != len(set(selected_ids)):
+                return None
+            by_id = {option.fact_id: option for option in options}
+            if any(fact_id not in by_id for fact_id in selected_ids):
+                return None
+            witness = _witness_from_options(
+                node,
+                tuple(by_id[fact_id] for fact_id in selected_ids),
             )
-            if target is not None:
-                return target
+            matches = _matching_nodes(nodes, witness)
+            return witness if [item.backend_id for item in matches] == [node.backend_id] else None
 
-        if name:
-            locator = self._page.get_by_role(role, name=name, exact=True)
-            if _locator_is_live_node(locator, marker):
-                return RoleTarget(role, name)
-
-        for attribute in ("name", "aria-label", "placeholder"):
-            target = self._attribute_target(
-                dom_node,
-                role,
-                name,
-                marker,
-                attribute,
-                attributes.get(attribute),
-                include_tag=True,
-            )
-            if target is not None:
-                return target
+        selected: list[_WitnessOption] = []
+        witness = _witness_from_options(node, ())
+        matches = _matching_nodes(nodes, witness)
+        for option in options:
+            candidate = _witness_from_options(node, (*selected, option))
+            candidate_matches = _matching_nodes(nodes, candidate)
+            if selected and len(candidate_matches) >= len(matches):
+                continue
+            selected.append(option)
+            witness = candidate
+            matches = candidate_matches
+            if [item.backend_id for item in matches] == [node.backend_id]:
+                return witness
         return None
 
-    def _attribute_target(
+    def _resolve_locator_backend_ids(
         self,
-        dom_node: _DomNode,
-        role: str,
-        name: str,
-        marker: _Marker,
-        attribute: str,
-        value: str | None,
-        *,
-        include_tag: bool,
-    ) -> CssTarget | None:
-        if not value:
-            return None
-        prefix = dom_node.tag if include_tag else ""
-        selector = f"{prefix}[{attribute}={json.dumps(value, ensure_ascii=False)}]"
-        try:
-            locator = self._page.locator(selector)
-            if not _locator_is_live_node(locator, marker):
-                return None
-            witness = ElementWitness(
-                tag=dom_node.tag,
-                role=role if name else None,
-                name=name or None,
-                attributes=((attribute, value),),
+        locator: BrowserLocator,
+    ) -> tuple[int, ...]:
+        if isinstance(locator, RoleLocator):
+            return tuple(
+                node.backend_id
+                for node in self._actionable_nodes
+                if node.role == locator.role and node.name == locator.name
             )
-            return CssTarget(selector, witness)
-        except ValueError:
-            return None
+        if isinstance(locator, CssLocator):
+            page_locator = self._page.locator(locator.selector)
+        elif isinstance(locator, XPathLocator):
+            page_locator = self._page.locator(f"xpath={locator.expression}")
+        else:
+            return ()
+        return _locator_backend_ids(self._page, page_locator)
+
+    def resolve_durable_target(
+        self,
+        target: DurableTarget,
+        operation: str,
+        *,
+        label: str | None = None,
+    ) -> tuple[_Locator, DurableTarget]:
+        snapshot = self._capture(include_targets=False)
+        witness_matches = _matching_nodes(self._actionable_nodes, target.witness)
+        if len(witness_matches) != 1:
+            raise ValueError("durable target witness is no longer unique")
+        intended = witness_matches[0]
+
+        confirmed = []
+        confirmed_backend_ids: set[int] = set()
+        for locator in target.locators:
+            raw_backend_ids = self._resolve_locator_backend_ids(locator)
+            matches = {
+                node.backend_id
+                for node in witness_matches
+                if node.backend_id in raw_backend_ids
+            }
+            if len(matches) > 1:
+                raise ValueError("durable locator conflicts with its witness")
+            if matches:
+                confirmed.append(locator)
+                confirmed_backend_ids.update(matches)
+        if not confirmed:
+            raise ValueError("no durable locator confirms the witnessed target")
+        if confirmed_backend_ids != {intended.backend_id}:
+            raise ValueError("durable locators resolve to conflicting targets")
+
+        locator = self.resolve_ref(
+            snapshot.token,
+            intended.ref,
+            operation,
+            label=label,
+        )
+        return locator, DurableTarget(tuple(confirmed), target.witness)
 
     def _remove_previous_markers(self) -> None:
         if self._marker_attribute is None:
@@ -710,33 +922,258 @@ class DomAxGrounder:
         self._token = None
         self._marker_attribute = None
         self._loader_id = None
+        self._dom_revision = None
         self._bindings = {}
+        self._actionable_nodes = ()
 
 
-def looks_generated_id(value: str) -> bool:
-    """Return whether an HTML id looks allocated by a UI runtime."""
+def _identity_attributes(
+    attributes: Mapping[str, str],
+    *,
+    exclude_textual: bool = False,
+) -> dict[str, str]:
+    excluded = {"name", "aria-label", "placeholder"} if exclude_textual else set()
+    identity = {
+        key: value
+        for key in _IDENTITY_ATTRIBUTES
+        if key not in excluded and (value := attributes.get(key))
+    }
+    element_id = attributes.get("id")
+    if element_id and not looks_generated_id(element_id):
+        identity["id"] = element_id
+    return identity
 
-    return any(pattern.search(value) for pattern in _GENERATED_ID_PATTERNS)
 
-
-def witness_matches(locator: _Locator, witness: ElementWitness) -> bool:
-    """Check the minimal recorded identity before a replay side effect."""
-
-    if locator.count() != 1:
+def _name_contains_live_value(locator: _Locator, name: str) -> bool:
+    if not name:
         return False
-    value = locator.evaluate(
-        """element => ({
-            tag: element.tagName.toLowerCase(),
-            attributes: Object.fromEntries(Array.from(element.attributes)
-                .map(attribute => [attribute.name, attribute.value]))
-        })"""
+    try:
+        return bool(
+            locator.evaluate(
+                """(element, accessibleName) => {
+                    const value = String(element.value || '');
+                    return Boolean(value) && accessibleName.includes(value);
+                }""",
+                name,
+            )
+        )
+    except Exception:
+        return True
+
+
+def _witness_options(node: _ActionableNode) -> tuple[_WitnessOption, ...]:
+    options: list[_WitnessOption] = []
+    for key in (*_TEST_ATTRIBUTES, "name", "aria-label"):
+        if value := node.attributes.get(key):
+            options.append(
+                _WitnessOption(f"attribute:{key}", "attribute", key, value)
+            )
+    options.append(
+        _WitnessOption(
+            "semantic:role-name",
+            "semantic",
+            "role-name",
+            f"{node.role}:{node.name}",
+        )
     )
-    if not isinstance(value, Mapping) or value.get("tag") != witness.tag:
-        return False
-    attributes = value.get("attributes")
-    if not isinstance(attributes, Mapping):
-        return False
-    return all(attributes.get(key) == expected for key, expected in witness.attributes)
+    for key in ("placeholder", "type"):
+        if value := node.attributes.get(key):
+            options.append(
+                _WitnessOption(f"attribute:{key}", "attribute", key, value)
+            )
+    seen_contexts: set[ContextFact] = set()
+    for index, context in enumerate(node.contexts):
+        if context.fact in seen_contexts:
+            continue
+        seen_contexts.add(context.fact)
+        options.append(
+            _WitnessOption(
+                f"context:{index}",
+                "context",
+                context.fact.relation,
+                context.fact.name,
+                context.fact,
+            )
+        )
+    if value := node.attributes.get("id"):
+        options.append(_WitnessOption("attribute:id", "attribute", "id", value))
+    return tuple(options)
+
+
+def _witness_from_options(
+    node: _ActionableNode,
+    options: Sequence[_WitnessOption],
+) -> ElementWitness:
+    attributes: list[tuple[str, str]] = []
+    contexts: list[ContextFact] = []
+    role: str | None = None
+    name: str | None = None
+    for option in options:
+        if option.kind == "attribute":
+            attributes.append((option.key, option.value))
+        elif option.kind == "semantic":
+            role = node.role
+            name = node.name
+        elif option.context is not None:
+            contexts.append(option.context)
+    return ElementWitness(
+        tag=node.tag,
+        role=role,
+        name=name,
+        attributes=tuple(attributes),
+        context=tuple(contexts),
+    )
+
+
+def _matching_nodes(
+    nodes: Sequence[_ActionableNode],
+    witness: ElementWitness,
+) -> list[_ActionableNode]:
+    required_context = set(witness.context)
+    return [
+        node
+        for node in nodes
+        if node.tag == witness.tag
+        and (witness.role is None or node.role == witness.role)
+        and (witness.name is None or node.name == witness.name)
+        and all(
+            node.attributes.get(key) == value
+            for key, value in witness.attributes
+        )
+        and required_context <= {context.fact for context in node.contexts}
+    ]
+
+
+def _candidate_locators(
+    node: _ActionableNode,
+    witness: ElementWitness,
+) -> tuple[BrowserLocator, ...]:
+    locators: list[BrowserLocator] = []
+    for key in (*_TEST_ATTRIBUTES, "id", "name", "aria-label", "placeholder", "type"):
+        value = node.attributes.get(key)
+        if not value:
+            continue
+        prefix = "" if key in {*_TEST_ATTRIBUTES, "id"} else node.tag
+        try:
+            locators.append(
+                CssLocator(
+                    f"{prefix}[{key}={json.dumps(value, ensure_ascii=False)}]"
+                )
+            )
+        except ValueError:
+            continue
+
+    locators.append(RoleLocator(node.role, node.name))
+    anchored = _anchored_xpath(node, witness)
+    if anchored is not None:
+        try:
+            locators.append(XPathLocator(anchored, "anchored"))
+        except ValueError:
+            pass
+    if not node.in_shadow and node.absolute_xpath is not None:
+        locators.append(XPathLocator(node.absolute_xpath, "absolute"))
+    return tuple(locators)
+
+
+def _locator_slot(locator: BrowserLocator) -> str:
+    if isinstance(locator, CssLocator):
+        return "css"
+    if isinstance(locator, RoleLocator):
+        return "role"
+    return f"xpath:{locator.mode}"
+
+
+def _anchored_xpath(
+    node: _ActionableNode,
+    witness: ElementWitness,
+) -> str | None:
+    context_by_fact = {context.fact: context for context in node.contexts}
+    selected_context = next(
+        (
+            context_by_fact[fact]
+            for fact in witness.context
+            if fact in context_by_fact
+        ),
+        None,
+    )
+    if selected_context is None:
+        return None
+    literal = _xpath_literal(selected_context.fact.name)
+    if literal is None:
+        return None
+
+    leaf = node.tag
+    for key, value in witness.attributes:
+        leaf_literal = _xpath_literal(value)
+        if leaf_literal is not None:
+            leaf += f"[@{key}={leaf_literal}]"
+            break
+    if (
+        selected_context.fact.relation == "nearest_heading"
+        and re.fullmatch(r"h[1-6]", selected_context.tag)
+    ):
+        return (
+            f"//{selected_context.tag}[normalize-space(.)={literal}]"
+            f"/following::{leaf}"
+        )
+    if selected_context.fact.relation == "ancestor":
+        for key in ("aria-label", "name"):
+            if selected_context.attributes.get(key) == selected_context.fact.name:
+                return (
+                    f"//{selected_context.tag}[@{key}={literal}]"
+                    f"//{leaf}"
+                )
+    return None
+
+
+def _xpath_literal(value: str) -> str | None:
+    if any(character in value for character in "\r\n\x00"):
+        return None
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    return None
+
+
+def _locator_backend_ids(page: _Page, locator: _Locator) -> tuple[int, ...]:
+    try:
+        count = locator.count()
+    except Exception:
+        return ()
+    if count < 1 or count > _MAX_CONTROLS:
+        return ()
+    marker = _Marker(
+        f"{REF_ATTRIBUTE_PREFIX}candidate-{secrets.token_hex(8)}",
+        "match",
+    )
+    try:
+        locator.evaluate_all(
+            "(elements, marker) => elements.forEach(element => "
+            "element.setAttribute(marker.name, marker.value))",
+            {"name": marker.attribute, "value": marker.value},
+        )
+        session = page.context.new_cdp_session(page)
+        try:
+            session.send("DOM.enable")
+            dom_result = session.send(
+                "DOM.getDocument",
+                {"depth": -1, "pierce": True},
+            )
+            root = dom_result.get("root")
+            return (
+                _backend_ids_with_marker(root, marker)
+                if isinstance(root, Mapping)
+                else ()
+            )
+        finally:
+            session.detach()
+    except Exception:
+        return ()
+    finally:
+        _remove_page_markers(page, marker.attribute)
+
+
 
 
 def _main_frame_identity(session: _CdpSession) -> tuple[str, str]:
@@ -761,23 +1198,58 @@ def _index_main_document(root: Mapping[str, object]) -> tuple[dict[int, _DomNode
     nodes: dict[int, _DomNode] = {}
     closed_roots = 0
 
-    def visit(node: Mapping[str, object], *, shadow_mode: str | None = None) -> None:
+    def visit(
+        node: Mapping[str, object],
+        *,
+        shadow_mode: str | None = None,
+        in_shadow: bool = False,
+        parent_xpath: str | None = None,
+        element_index: int = 1,
+    ) -> None:
         nonlocal closed_roots
         backend_id = node.get("backendNodeId")
         node_name = node.get("nodeName")
+        node_type = node.get("nodeType")
+        tag = node_name.lower() if isinstance(node_name, str) else ""
+        absolute_xpath = (
+            f"{parent_xpath or ''}/{tag}[{element_index}]"
+            if node_type == 1 and tag and not in_shadow
+            else None
+        )
         if isinstance(backend_id, int) and isinstance(node_name, str):
             nodes[backend_id] = _DomNode(
-                tag=node_name.lower(),
+                tag=tag,
                 attributes=_dom_attributes(node.get("attributes")),
                 closed_shadow=shadow_mode == "closed",
+                in_shadow=in_shadow,
+                absolute_xpath=absolute_xpath,
             )
+        element_counts: dict[str, int] = {}
         for child in _mapping_sequence(node.get("children")):
-            visit(child, shadow_mode=shadow_mode)
+            child_name = child.get("nodeName")
+            child_tag = (
+                child_name.lower() if isinstance(child_name, str) else ""
+            )
+            child_index = 1
+            if child.get("nodeType") == 1 and child_tag:
+                child_index = element_counts.get(child_tag, 0) + 1
+                element_counts[child_tag] = child_index
+            visit(
+                child,
+                shadow_mode=shadow_mode,
+                in_shadow=in_shadow,
+                parent_xpath=absolute_xpath or parent_xpath,
+                element_index=child_index,
+            )
         for shadow_root in _mapping_sequence(node.get("shadowRoots")):
             root_mode = str(shadow_root.get("shadowRootType", "")) or shadow_mode
             if root_mode == "closed":
                 closed_roots += 1
-            visit(shadow_root, shadow_mode=root_mode)
+            visit(
+                shadow_root,
+                shadow_mode=root_mode,
+                in_shadow=True,
+            )
         # contentDocument belongs to an iframe and is deliberately unsupported.
 
     visit(root)
