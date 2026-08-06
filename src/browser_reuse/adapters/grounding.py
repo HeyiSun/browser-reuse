@@ -284,7 +284,6 @@ class DomAxGrounder:
         self._token: str | None = None
         self._marker_attribute: str | None = None
         self._loader_id: str | None = None
-        self._dom_revision: int | None = None
         self._bindings: dict[str, _RefBinding] = {}
         self._actionable_nodes: tuple[_ActionableNode, ...] = ()
 
@@ -455,7 +454,6 @@ class DomAxGrounder:
         self._token = token
         self._marker_attribute = marker_attribute
         self._loader_id = loader_before
-        self._dom_revision = revision_before
         self._bindings = bindings
         return BrowserSnapshot(
             text=text,
@@ -475,7 +473,6 @@ class DomAxGrounder:
         if (
             token != self._token
             or self._loader_id is None
-            or self._dom_revision is None
         ):
             raise ValueError("browser ref belongs to a stale observation")
         binding = self._bindings.get(ref)
@@ -507,8 +504,6 @@ class DomAxGrounder:
             session.detach()
         if loader_id != self._loader_id:
             raise ValueError("browser ref belongs to a replaced document")
-        if _dom_revision(self._page) != self._dom_revision:
-            raise ValueError("browser ref belongs to a mutated observation")
         if live_backend_ids != (binding.backend_id,):
             raise ValueError("browser ref no longer resolves to its live node")
         live_dom = live_dom_nodes.get(binding.backend_id)
@@ -922,7 +917,6 @@ class DomAxGrounder:
         self._token = None
         self._marker_attribute = None
         self._loader_id = None
-        self._dom_revision = None
         self._bindings = {}
         self._actionable_nodes = ()
 
