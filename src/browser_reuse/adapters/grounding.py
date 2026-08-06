@@ -411,10 +411,6 @@ class DomAxGrounder:
                     raise _TransientCaptureError(
                         "document changed while compiling durable targets"
                     )
-                if _dom_revision(self._page) != revision_before:
-                    raise _TransientCaptureError(
-                        "document mutated while compiling durable targets"
-                    )
             except Exception:
                 _remove_page_markers(self._page, marker_attribute)
                 raise
