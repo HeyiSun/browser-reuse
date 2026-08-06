@@ -36,7 +36,7 @@ def snapshot_step(step: Mapping[str, object]) -> dict[str, object]:
 
 
 def _reject_transient_browser_identity(step: Mapping[str, object]) -> None:
-    from browser_reuse.adapters.browser import transient_identity_keys
+    from browser_reuse.browser.actions import transient_identity_keys
 
     forbidden_keys = transient_identity_keys()
 
@@ -61,7 +61,7 @@ def _reject_transient_browser_identity(step: Mapping[str, object]) -> None:
 def _validate_browser_action_schema(step: Mapping[str, object]) -> None:
     if step.get("op") not in {"click", "fill", "select_option"}:
         return
-    from browser_reuse.adapters.browser import action_from_step
+    from browser_reuse.browser.actions import action_from_step
 
     try:
         action_from_step(step)

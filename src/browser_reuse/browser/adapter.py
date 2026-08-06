@@ -8,7 +8,7 @@ from typing import Protocol
 from browser_reuse.core import Observation
 from browser_reuse.interfaces import ActionDispatchedError
 
-from .browser import (
+from .actions import (
     BrowserAction,
     Click,
     DurableTarget,
@@ -17,7 +17,7 @@ from .browser import (
     action_from_step,
     action_to_step,
 )
-from .grounding import DOM_REVISION_SCRIPT, DomAxGrounder
+from .dom_ax import DOM_REVISION_SCRIPT, DomAxGrounder
 
 
 _POLL_MS = 200
@@ -66,7 +66,7 @@ class _Page(Protocol):
     def wait_for_timeout(self, timeout: float) -> None: ...
 
 
-class GenericBrowserAdapter:
+class DomAxBrowserAdapter:
     """Observe through DOM+AX, execute live refs, and replay witnessed targets."""
 
     def __init__(

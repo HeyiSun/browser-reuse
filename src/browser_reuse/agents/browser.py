@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
-from browser_reuse.adapters import action_from_step, action_to_step
+from browser_reuse.browser.actions import action_from_step, action_to_step
 from browser_reuse.core import Observation, TaskSpec
 from browser_reuse.interfaces import Adapter
 from browser_reuse.llm import ChatModel, Message

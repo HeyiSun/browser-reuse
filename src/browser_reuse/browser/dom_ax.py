@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from .browser import (
+from .actions import (
     BrowserLocator,
     Click,
     ContextFact,
