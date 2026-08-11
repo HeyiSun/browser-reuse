@@ -1414,8 +1414,8 @@ def _backend_ids_with_marker(
 
 
 def _operation(role: str, tag: str) -> str | None:
-    if role == "combobox" and tag == "select":
-        return "select_option"
+    if role == "combobox":
+        return "select_option" if tag == "select" else "fill"
     if role in _FILL_ROLES:
         return "fill"
     if role in _CLICK_ROLES and tag != "option":
