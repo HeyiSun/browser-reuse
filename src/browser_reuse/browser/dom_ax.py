@@ -160,8 +160,6 @@ class _Locator(Protocol):
 
     def get_attribute(self, name: str) -> str | None: ...
 
-    def input_value(self) -> str: ...
-
     def is_editable(self) -> bool: ...
 
     def is_enabled(self) -> bool: ...
@@ -740,7 +738,7 @@ class DomAxGrounder:
         if public_state:
             control["state"] = public_state
         if operation == "fill" and not secret:
-            control["value"] = locator.input_value()
+            control["value"] = _editable_value(locator)
         elif operation == "select_option":
             if secret:
                 _remove_marker(session, backend_id, marker)
@@ -1003,6 +1001,19 @@ def _name_contains_live_value(locator: _Locator, name: str) -> bool:
         )
     except Exception:
         return True
+
+
+def _editable_value(locator: _Locator) -> str:
+    """Read an editable control without assuming it is a native input."""
+
+    value = locator.evaluate(
+        """element => {
+            if ('value' in element) return String(element.value || '');
+            if (element.isContentEditable) return element.textContent || '';
+            return '';
+        }"""
+    )
+    return value if isinstance(value, str) else ""
 
 
 def _receives_pointer_events(locator: _Locator) -> bool:
