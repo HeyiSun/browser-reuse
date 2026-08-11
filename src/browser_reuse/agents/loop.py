@@ -70,7 +70,23 @@ def run_agent_loop(
                 )
             try:
                 adapter.execute(plan.execute_step)
-            except ActionDispatchedError:
+            except ActionDispatchedError as dispatched_error:
+                try:
+                    after = adapter.observe()
+                except Exception as observation_error:
+                    actions.append(
+                        RecordedAction(
+                            execute_step=dict(plan.execute_step),
+                            recipe_step=(
+                                dict(plan.recipe_step)
+                                if plan.recipe_step is not None
+                                else None
+                            ),
+                            before=observation,
+                            after=None,
+                        )
+                    )
+                    raise dispatched_error from observation_error
                 actions.append(
                     RecordedAction(
                         execute_step=dict(plan.execute_step),
@@ -80,10 +96,11 @@ def run_agent_loop(
                             else None
                         ),
                         before=observation,
-                        after=None,
+                        after=after,
                     )
                 )
-                raise
+                observation = after
+                continue
             after = adapter.observe()
             actions.append(
                 RecordedAction(
