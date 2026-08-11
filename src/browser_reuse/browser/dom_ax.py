@@ -307,18 +307,18 @@ class DomAxGrounder:
         self._actionable_nodes: tuple[_ActionableNode, ...] = ()
 
     def capture(self) -> BrowserSnapshot:
-        """Capture main-document and open-shadow DOM+AX with one transient retry."""
+        """Capture main-document and open-shadow DOM+AX with bounded retries."""
 
         return self._capture(include_targets=True)
 
     def _capture(self, *, include_targets: bool) -> BrowserSnapshot:
         """Retry only when navigation or mutation tears the whole capture."""
 
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return self._capture_once(include_targets=include_targets)
             except _TransientCaptureError:
-                if attempt == 1:
+                if attempt == 2:
                     raise
                 self._page.wait_for_timeout(200)
         raise AssertionError("unreachable capture retry state")
