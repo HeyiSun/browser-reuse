@@ -202,6 +202,7 @@ class _DomNode:
 
     tag: str
     attributes: Mapping[str, str]
+    clickable: bool
     closed_shadow: bool
     in_shadow: bool
     absolute_xpath: str | None
@@ -335,11 +336,16 @@ class DomAxGrounder:
         try:
             session.send("Page.enable")
             session.send("DOM.enable")
+            session.send("DOMSnapshot.enable")
             session.send("Accessibility.enable")
             frame_id, loader_before = _main_frame_identity(session)
             dom_result = session.send(
                 "DOM.getDocument",
                 {"depth": -1, "pierce": True},
+            )
+            dom_snapshot_result = session.send(
+                "DOMSnapshot.captureSnapshot",
+                {"computedStyles": []},
             )
             ax_result = session.send(
                 "Accessibility.getFullAXTree",
@@ -356,9 +362,14 @@ class DomAxGrounder:
             if not isinstance(dom_root, Mapping) or not isinstance(ax_nodes, list):
                 raise RuntimeError("CDP returned an invalid DOM or AX snapshot")
 
-            dom_nodes, closed_shadow_roots = _index_main_document(dom_root)
+            clickable_backend_ids = _clickable_backend_ids(dom_snapshot_result)
+            dom_nodes, closed_shadow_roots = _index_main_document(
+                dom_root,
+                clickable_backend_ids,
+            )
             diagnostics: dict[str, object] = {
                 "dom_nodes": len(dom_nodes),
+                "dom_clickable_nodes": len(clickable_backend_ids),
                 "ax_nodes": len(ax_nodes),
                 "joined_ax_nodes": 0,
                 "unresolved_ax_nodes": 0,
@@ -702,7 +713,7 @@ class DomAxGrounder:
 
         role = _ax_text(ax_node.get("role")).lower()
         name = _ax_text(ax_node.get("name"))
-        operation = _operation(role, dom_node.tag)
+        operation = _operation(role, dom_node.tag, dom_node.clickable)
         if (
             operation is None
             or dom_node.closed_shadow
@@ -732,6 +743,8 @@ class DomAxGrounder:
         public_name = (
             "" if secret and _name_contains_live_value(locator, name) else name
         )
+        if not public_name and dom_node.clickable and not secret:
+            public_name = _dom_click_name(dom_node.attributes)
         control: dict[str, object] = {"op": operation, "name": public_name}
         public_state = _public_dom_state(dom_node.attributes)
         if public_state:
@@ -776,7 +789,7 @@ class DomAxGrounder:
                     exclude_textual=secret,
                 ),
                 role=role,
-                name=public_name,
+                name=name if public_name == name else "",
                 operation=operation,
                 contexts=contexts,
                 in_shadow=dom_node.in_shadow,
@@ -1314,7 +1327,10 @@ def _dom_revision(page: _Page) -> int:
     return int(value["version"])
 
 
-def _index_main_document(root: Mapping[str, object]) -> tuple[dict[int, _DomNode], int]:
+def _index_main_document(
+    root: Mapping[str, object],
+    clickable_backend_ids: set[int] | frozenset[int] = frozenset(),
+) -> tuple[dict[int, _DomNode], int]:
     """Index main DOM and open shadow roots without descending into iframes."""
 
     nodes: dict[int, _DomNode] = {}
@@ -1342,6 +1358,7 @@ def _index_main_document(root: Mapping[str, object]) -> tuple[dict[int, _DomNode
             nodes[backend_id] = _DomNode(
                 tag=tag,
                 attributes=_dom_attributes(node.get("attributes")),
+                clickable=backend_id in clickable_backend_ids,
                 closed_shadow=shadow_mode == "closed",
                 in_shadow=in_shadow,
                 absolute_xpath=absolute_xpath,
@@ -1413,14 +1430,48 @@ def _backend_ids_with_marker(
     return tuple(matches)
 
 
-def _operation(role: str, tag: str) -> str | None:
+def _operation(role: str, tag: str, dom_clickable: bool = False) -> str | None:
     if role == "combobox":
         return "select_option" if tag == "select" else "fill"
     if role in _FILL_ROLES:
         return "fill"
     if role in _CLICK_ROLES and tag != "option":
         return "click"
+    if dom_clickable and role not in _STRUCTURAL_ROLES - {"generic"}:
+        return "click"
     return None
+
+
+def _dom_click_name(attributes: Mapping[str, str]) -> str:
+    """Return a bounded semantic hint for a DOM-clickable AX-generic node."""
+
+    return attributes.get("title", "").strip()[:200]
+
+
+def _clickable_backend_ids(result: Mapping[str, object]) -> set[int]:
+    """Read Chromium's clickability bits for the supported main document."""
+
+    documents = result.get("documents")
+    if not isinstance(documents, list) or not documents:
+        return set()
+    document = documents[0]
+    if not isinstance(document, Mapping):
+        return set()
+    nodes = document.get("nodes")
+    if not isinstance(nodes, Mapping):
+        return set()
+    backend_ids = nodes.get("backendNodeId")
+    clickable = nodes.get("isClickable")
+    indices = clickable.get("index") if isinstance(clickable, Mapping) else None
+    if not isinstance(backend_ids, list) or not isinstance(indices, list):
+        return set()
+    return {
+        backend_ids[index]
+        for index in indices
+        if isinstance(index, int)
+        and 0 <= index < len(backend_ids)
+        and isinstance(backend_ids[index], int)
+    }
 
 
 def _set_marker(session: _CdpSession, backend_id: int, marker: _Marker) -> bool:
