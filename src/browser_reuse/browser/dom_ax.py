@@ -713,7 +713,12 @@ class DomAxGrounder:
 
         role = _ax_text(ax_node.get("role")).lower()
         name = _ax_text(ax_node.get("name"))
-        operation = _operation(role, dom_node.tag, dom_node.clickable)
+        dom_click_name = name or _dom_click_name(dom_node.attributes)
+        operation = _operation(
+            role,
+            dom_node.tag,
+            dom_node.clickable and bool(dom_click_name),
+        )
         if (
             operation is None
             or dom_node.closed_shadow
@@ -1437,7 +1442,7 @@ def _operation(role: str, tag: str, dom_clickable: bool = False) -> str | None:
         return "fill"
     if role in _CLICK_ROLES and tag != "option":
         return "click"
-    if dom_clickable and role not in _STRUCTURAL_ROLES - {"generic"}:
+    if dom_clickable and role and role not in _STRUCTURAL_ROLES - {"generic"}:
         return "click"
     return None
 
