@@ -544,6 +544,8 @@ class DomAxGrounder:
             raise ValueError("browser ref no longer resolves to its live node")
         if not locator.is_visible() or not locator.is_enabled():
             raise ValueError("browser ref is no longer actionable")
+        if operation == "click" and not _receives_pointer_events(locator):
+            raise ValueError("browser ref is obscured by another element")
         if operation == "fill" and not locator.is_editable():
             raise ValueError("browser ref is no longer editable")
         if operation == "select_option":
@@ -725,6 +727,7 @@ class DomAxGrounder:
             or not locator.is_visible()
             or not locator.is_enabled()
             or (operation == "fill" and not locator.is_editable())
+            or (operation == "click" and not _receives_pointer_events(locator))
         ):
             _remove_marker(session, backend_id, marker)
             return None
@@ -1000,6 +1003,49 @@ def _name_contains_live_value(locator: _Locator, name: str) -> bool:
         )
     except Exception:
         return True
+
+
+def _receives_pointer_events(locator: _Locator) -> bool:
+    """Reject an on-screen control when another element covers it.
+
+    Off-screen controls stay eligible because observation must not scroll the
+    page. Playwright performs its full actionability check at execution time.
+    """
+
+    try:
+        return bool(
+            locator.evaluate(
+                """element => {
+                    const rect = element.getBoundingClientRect();
+                    const left = Math.max(0, rect.left);
+                    const right = Math.min(window.innerWidth, rect.right);
+                    const top = Math.max(0, rect.top);
+                    const bottom = Math.min(window.innerHeight, rect.bottom);
+                    if (right <= left || bottom <= top) return true;
+
+                    const hit = document.elementFromPoint(
+                        (left + right) / 2,
+                        (top + bottom) / 2
+                    );
+                    if (!hit) return true;
+                    if (hit === element || element.contains(hit)) return true;
+
+                    const wrappingLabel = element.closest('label');
+                    if (wrappingLabel && wrappingLabel.contains(hit)) return true;
+                    if (element.id) {
+                        const label = document.querySelector(
+                            `label[for="${CSS.escape(element.id)}"]`
+                        );
+                        if (label && (label === hit || label.contains(hit))) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
 
 
 def _witness_options(node: _ActionableNode) -> tuple[_WitnessOption, ...]:
