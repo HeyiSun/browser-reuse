@@ -83,6 +83,9 @@ _FILL_ROLES = frozenset({"searchbox", "spinbutton", "textbox"})
 _STRUCTURAL_ROLES = frozenset(
     {"generic", "none", "inlinetextbox", "rootwebarea"}
 )
+_DOM_CLICK_EXCLUDED_ROLES = frozenset(
+    {"none", "inlinetextbox", "rootwebarea"}
+)
 # Attribute order is evidence priority, not a complete DOM attribute list.
 _TEST_ATTRIBUTES = (
     "data-testid",
@@ -313,7 +316,7 @@ class DomAxGrounder:
         return self._capture(include_targets=True)
 
     def _capture(self, *, include_targets: bool) -> BrowserSnapshot:
-        """Retry only when navigation or mutation tears the whole capture."""
+        """Retry only when document replacement tears the whole capture."""
 
         for attempt in range(3):
             try:
@@ -1442,7 +1445,7 @@ def _operation(role: str, tag: str, dom_clickable: bool = False) -> str | None:
         return "fill"
     if role in _CLICK_ROLES and tag != "option":
         return "click"
-    if dom_clickable and role and role not in _STRUCTURAL_ROLES - {"generic"}:
+    if dom_clickable and role and role not in _DOM_CLICK_EXCLUDED_ROLES:
         return "click"
     return None
 
