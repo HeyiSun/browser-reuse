@@ -409,10 +409,9 @@ class DomAxGrounder:
                 raise _TransientCaptureError(
                     "document changed while publishing browser refs"
                 )
-            if _dom_revision(self._page) != revision_before:
-                raise _TransientCaptureError(
-                    "document mutated while capturing DOM and AX"
-                )
+            diagnostics["mutated_during_capture"] = (
+                _dom_revision(self._page) != revision_before
+            )
         except Exception:
             _remove_page_markers(self._page, marker_attribute)
             raise
@@ -1034,10 +1033,18 @@ def _receives_pointer_events(locator: _Locator) -> bool:
                     const bottom = Math.min(window.innerHeight, rect.bottom);
                     if (right <= left || bottom <= top) return true;
 
-                    const hit = document.elementFromPoint(
+                    let hit = document.elementFromPoint(
                         (left + right) / 2,
                         (top + bottom) / 2
                     );
+                    while (hit && hit.shadowRoot) {
+                        const inner = hit.shadowRoot.elementFromPoint(
+                            (left + right) / 2,
+                            (top + bottom) / 2
+                        );
+                        if (!inner || inner === hit) break;
+                        hit = inner;
+                    }
                     if (!hit) return true;
                     if (hit === element || element.contains(hit)) return true;
 
