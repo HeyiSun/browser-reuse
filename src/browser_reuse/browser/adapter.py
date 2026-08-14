@@ -94,6 +94,7 @@ class DomAxBrowserAdapter:
         grounder: DomAxGrounder | None = None,
         locator_fallback: LocatorFallbackMode = "stored_candidates",
         locator_candidate_provider: LocatorCandidateProvider | None = None,
+        include_raw_class: bool = True,
     ) -> None:
         if locator_fallback not in {
             "none",
@@ -108,8 +109,13 @@ class DomAxBrowserAdapter:
             raise ValueError(
                 "stored_then_llm requires a locator candidate provider"
             )
+        if not isinstance(include_raw_class, bool):
+            raise ValueError("include_raw_class must be a boolean")
         self._page = page
-        self._grounder = grounder or DomAxGrounder(page)  # type: ignore[arg-type]
+        self._grounder = grounder or DomAxGrounder(  # type: ignore[arg-type]
+            page,
+            include_raw_class=include_raw_class,
+        )
         self._locator_fallback = locator_fallback
         self._locator_candidate_provider = locator_candidate_provider
         # Streaming requests never settle, so the callbacks exclude them.

@@ -78,6 +78,7 @@ def run_generic_browser_agent(
     model: ChatModel,
     *,
     max_decisions: int = 35,
+    prompt_suffix: str = "",
 ) -> AgentRun:
     """Run the high-level DOM+AX Agent without exposing loop protocol hooks."""
 
@@ -98,6 +99,7 @@ def run_generic_browser_agent(
             observation,
             recent_actions=recent_actions,
             page_changed_after_last_action=changed,
+            system_prompt=GENERIC_BROWSER_PROMPT + prompt_suffix,
         )
         return result
 
@@ -201,12 +203,14 @@ def _messages(
     *,
     recent_actions: Sequence[Mapping[str, object]] = (),
     page_changed_after_last_action: bool | None = None,
+    system_prompt: str = GENERIC_BROWSER_PROMPT,
 ) -> tuple[Message, ...]:
     messages, _ = _message_bundle(
         task,
         observation,
         recent_actions=recent_actions,
         page_changed_after_last_action=page_changed_after_last_action,
+        system_prompt=system_prompt,
     )
     return messages
 
@@ -217,6 +221,7 @@ def _message_bundle(
     *,
     recent_actions: Sequence[Mapping[str, object]] = (),
     page_changed_after_last_action: bool | None = None,
+    system_prompt: str = GENERIC_BROWSER_PROMPT,
 ) -> tuple[tuple[Message, ...], frozenset[str]]:
     """Build one bounded message without splitting snapshot or action records."""
 
@@ -263,7 +268,7 @@ def _message_bundle(
 
     def fits(content: str) -> bool:
         return (
-            len(GENERIC_BROWSER_PROMPT.encode("utf-8"))
+            len(system_prompt.encode("utf-8"))
             + len(content.encode("utf-8"))
             <= _MODEL_PAYLOAD_BUDGET_BYTES
         )
@@ -324,7 +329,7 @@ def _message_bundle(
             user_content = candidate_content
 
     messages = (
-        Message(role="system", content=GENERIC_BROWSER_PROMPT),
+        Message(role="system", content=system_prompt),
         Message(role="user", content=user_content),
     )
     return messages, frozenset(selected_controls)

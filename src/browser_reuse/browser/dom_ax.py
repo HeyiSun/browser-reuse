@@ -315,9 +315,11 @@ class DomAxGrounder:
         page: _Page,
         *,
         witness_fact_selector: WitnessFactSelector | None = None,
+        include_raw_class: bool = True,
     ) -> None:
         self._page = page
         self._witness_fact_selector = witness_fact_selector
+        self._include_raw_class = include_raw_class
         # All fields below belong to the latest capture and are replaced as a unit.
         self._token: str | None = None
         self._marker_attribute: str | None = None
@@ -827,7 +829,10 @@ class DomAxGrounder:
         if not public_name and dom_node.clickable and not secret:
             public_name = _dom_click_name(dom_node.attributes)
         control: dict[str, object] = {"op": operation, "name": public_name}
-        public_state = _public_dom_state(dom_node.attributes)
+        public_state = _public_dom_state(
+            dom_node.attributes,
+            include_raw_class=self._include_raw_class,
+        )
         if public_state:
             control["state"] = public_state
         if operation in {"fill", "choose_combobox_option"} and not secret:
@@ -1790,7 +1795,11 @@ def _first_admissible_class(value: str) -> str | None:
     )
 
 
-def _public_dom_state(attributes: Mapping[str, str]) -> dict[str, str]:
+def _public_dom_state(
+    attributes: Mapping[str, str],
+    *,
+    include_raw_class: bool,
+) -> dict[str, str]:
     """Expose bounded UI state for decisions, never for durable identity."""
 
     state: dict[str, str] = {}
@@ -1798,7 +1807,8 @@ def _public_dom_state(attributes: Mapping[str, str]) -> dict[str, str]:
         value = attributes.get(key)
         if value:
             state[key] = value[:100]
-    class_name = attributes.get("class", "").strip()
-    if class_name:
-        state["class"] = class_name[:200]
+    if include_raw_class:
+        class_name = attributes.get("class", "").strip()
+        if class_name:
+            state["class"] = class_name[:200]
     return state
