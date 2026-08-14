@@ -278,6 +278,7 @@ class _RefBinding:
     name: str
     state: tuple[tuple[str, object], ...]
     labels: tuple[str, ...]
+    requires_dom_clickable: bool
 
 
 @dataclass(frozen=True)
@@ -486,6 +487,9 @@ class DomAxGrounder:
                 name=str(control.pop("_name")),
                 state=tuple(control.pop("_state")),
                 labels=tuple(control.get("labels", ())),
+                requires_dom_clickable=bool(
+                    control.pop("_requires_dom_clickable")
+                ),
             )
         self._token = token
         self._marker_attribute = marker_attribute
@@ -538,6 +542,15 @@ class DomAxGrounder:
                 else {}
             )
             live_semantics = _backend_semantics(session, binding.backend_id)
+            live_clickable_backend_ids: set[int] | None = None
+            if binding.requires_dom_clickable:
+                session.send("DOMSnapshot.enable")
+                live_clickable_backend_ids = _clickable_backend_ids(
+                    session.send(
+                        "DOMSnapshot.captureSnapshot",
+                        {"computedStyles": []},
+                    )
+                )
         finally:
             session.detach()
         if loader_id != self._loader_id:
@@ -549,6 +562,11 @@ class DomAxGrounder:
             raise ValueError("browser ref DOM identity changed")
         if live_semantics != (binding.role, binding.name, binding.state):
             raise ValueError("browser ref semantic identity changed")
+        if (
+            binding.requires_dom_clickable
+            and binding.backend_id not in (live_clickable_backend_ids or set())
+        ):
+            raise ValueError("browser ref lost its DOM clickability evidence")
 
         locator = self._page.locator(_marker_selector(binding.marker))
         if locator.count() != 1:
@@ -717,11 +735,13 @@ class DomAxGrounder:
         role = _ax_text(ax_node.get("role")).lower()
         name = _ax_text(ax_node.get("name"))
         dom_click_name = name or _dom_click_name(dom_node.attributes)
+        semantic_operation = _operation(role, dom_node.tag)
         operation = _operation(
             role,
             dom_node.tag,
             dom_node.clickable and bool(dom_click_name),
         )
+        requires_dom_clickable = semantic_operation is None and operation == "click"
         if (
             operation is None
             or dom_node.closed_shadow
@@ -809,6 +829,7 @@ class DomAxGrounder:
         control["_role"] = role
         control["_name"] = name
         control["_state"] = _semantic_state(ax_node)
+        control["_requires_dom_clickable"] = requires_dom_clickable
         controls[ref] = control
         return ref, public_name
 
@@ -1066,7 +1087,7 @@ def _receives_pointer_events(locator: _Locator) -> bool:
                         if (!inner || inner === hit) break;
                         hit = inner;
                     }
-                    if (!hit) return true;
+                    if (!hit) return false;
                     if (hit === element || element.contains(hit)) return true;
 
                     const wrappingLabel = element.closest('label');

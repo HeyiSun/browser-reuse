@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 
 from browser_reuse.browser.actions import action_from_step, action_to_step
@@ -32,6 +33,12 @@ action. The caller independently verifies the final state.
 """
 
 
+# This is the complete provider-neutral message budget at the ChatModel boundary:
+# both the fixed system prompt and the final UTF-8 user message count toward it.
+_MODEL_PAYLOAD_BUDGET_BYTES = 64_000
+_SNAPSHOT_REF = re.compile(r"(?:^|\s)\[ref=([^\]\s]+)\]\s*$")
+
+
 def run_generic_browser_agent(
     task: TaskSpec,
     adapter: Adapter,
@@ -43,27 +50,34 @@ def run_generic_browser_agent(
 
     recent_actions: list[dict[str, object]] = []
     public_state_before_action: object = None
+    visible_refs: frozenset[str] = frozenset()
 
     def messages(task: TaskSpec, observation: Observation) -> tuple[Message, ...]:
+        nonlocal visible_refs
         current_public_state = _public_state(observation)
         changed = (
             None
             if not recent_actions
             else current_public_state != public_state_before_action
         )
-        return _messages(
+        result, visible_refs = _message_bundle(
             task,
             observation,
             recent_actions=recent_actions,
             page_changed_after_last_action=changed,
         )
+        return result
 
     def parse_step(
         content: str,
         observation: Observation,
     ) -> ActionPlan | None:
         nonlocal public_state_before_action
-        step = _parse_step(content, observation)
+        step = _parse_step(
+            content,
+            observation,
+            visible_refs=visible_refs,
+        )
         if step is not None:
             decision = json.loads(content)
             recent_actions.append({
@@ -94,36 +108,138 @@ def _messages(
     recent_actions: Sequence[Mapping[str, object]] = (),
     page_changed_after_last_action: bool | None = None,
 ) -> tuple[Message, ...]:
-    available = _public_controls(observation)
-    return (
-        Message(role="system", content=GENERIC_BROWSER_PROMPT),
-        Message(
-            role="user",
-            content=json.dumps(
-                {
-                    "goal": task.goal,
-                    "page": {
-                        "url": observation.data.get("url"),
-                        "title": observation.data.get("title"),
-                        "snapshot": observation.data.get("snapshot"),
-                        "available_actions": available,
-                    },
-                    "last_action": recent_actions[-1] if recent_actions else None,
-                    "recent_actions": list(recent_actions),
-                    "page_changed_after_last_action": (
-                        page_changed_after_last_action
-                    ),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-        ),
+    messages, _ = _message_bundle(
+        task,
+        observation,
+        recent_actions=recent_actions,
+        page_changed_after_last_action=page_changed_after_last_action,
     )
+    return messages
+
+
+def _message_bundle(
+    task: TaskSpec,
+    observation: Observation,
+    *,
+    recent_actions: Sequence[Mapping[str, object]] = (),
+    page_changed_after_last_action: bool | None = None,
+) -> tuple[tuple[Message, ...], frozenset[str]]:
+    """Build one bounded message without splitting snapshot or action records."""
+
+    all_controls = _public_controls(observation)
+    snapshot = observation.data.get("snapshot")
+    raw_lines = snapshot.splitlines() if isinstance(snapshot, str) else []
+    lines: list[tuple[int, str, str | None]] = []
+    for index, line in enumerate(raw_lines):
+        match = _SNAPSHOT_REF.search(line)
+        ref = match.group(1) if match else None
+        # A line with an orphan or malformed executable marker cannot remain in
+        # the model snapshot because it would disagree with available_actions.
+        if "[ref=" in line and (ref is None or ref not in all_controls):
+            continue
+        lines.append((index, line, ref))
+
+    history = [dict(action) for action in recent_actions]
+    selected_history = history[-1:]  # The last action is safety-critical feedback.
+    selected_lines: dict[int, str] = {}
+    selected_controls: dict[str, dict[str, object]] = {}
+
+    def content_for(
+        candidate_lines: Mapping[int, str],
+        candidate_controls: Mapping[str, Mapping[str, object]],
+        candidate_history: Sequence[Mapping[str, object]],
+    ) -> str:
+        ordered_snapshot = "\n".join(
+            line for _, line in sorted(candidate_lines.items())
+        )
+        payload = {
+            "goal": task.goal,
+            "page": {
+                "url": observation.data.get("url"),
+                "title": observation.data.get("title"),
+                "snapshot": ordered_snapshot,
+                "available_actions": dict(candidate_controls),
+            },
+            "last_action": history[-1] if history else None,
+            "recent_actions": list(candidate_history),
+            "page_changed_after_last_action": page_changed_after_last_action,
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def fits(content: str) -> bool:
+        return (
+            len(GENERIC_BROWSER_PROMPT.encode("utf-8"))
+            + len(content.encode("utf-8"))
+            <= _MODEL_PAYLOAD_BUDGET_BYTES
+        )
+
+    user_content = content_for(selected_lines, selected_controls, selected_history)
+    if not fits(user_content):
+        raise ValueError(
+            "browser model payload cannot fit the 64000-byte budget without "
+            "dropping the goal, page identity, or latest action"
+        )
+
+    # Keep executable controls first. Each candidate is admitted together with
+    # its complete snapshot line and complete public control object.
+    for index, line, ref in lines:
+        if ref is None:
+            continue
+        candidate_lines = {**selected_lines, index: line}
+        candidate_controls = dict(selected_controls)
+        candidate_controls[ref] = all_controls[ref]
+        candidate_content = content_for(
+            candidate_lines,
+            candidate_controls,
+            selected_history,
+        )
+        if fits(candidate_content):
+            selected_lines = candidate_lines
+            selected_controls = candidate_controls
+            user_content = candidate_content
+
+    # Preserve as much recent history as possible, newest first, while always
+    # retaining chronological order and the latest action.
+    for action in reversed(history[:-1]):
+        candidate_history = [action, *selected_history]
+        candidate_content = content_for(
+            selected_lines,
+            selected_controls,
+            candidate_history,
+        )
+        if fits(candidate_content):
+            selected_history = candidate_history
+            user_content = candidate_content
+        else:
+            break
+
+    # Context-only snapshot lines use the remaining budget. They are restored
+    # to their original order; an oversized line is skipped whole.
+    for index, line, ref in lines:
+        if ref is not None:
+            continue
+        candidate_lines = {**selected_lines, index: line}
+        candidate_content = content_for(
+            candidate_lines,
+            selected_controls,
+            selected_history,
+        )
+        if fits(candidate_content):
+            selected_lines = candidate_lines
+            user_content = candidate_content
+
+    messages = (
+        Message(role="system", content=GENERIC_BROWSER_PROMPT),
+        Message(role="user", content=user_content),
+    )
+    return messages, frozenset(selected_controls)
 
 
 def _parse_step(
     content: str,
     observation: Observation,
+    *,
+    visible_refs: frozenset[str] | None = None,
 ) -> ActionPlan | None:
     value = json.loads(content)
     if not isinstance(value, dict):
@@ -141,6 +257,8 @@ def _parse_step(
     ref = value.get("ref")
     if not isinstance(ref, str):
         raise ValueError("model browser action requires a string ref")
+    if visible_refs is not None and ref not in visible_refs:
+        raise ValueError("model ref/action is not present in the observation")
     control = _find_control(observation, ref, operation)
     snapshot_token = observation.data.get("snapshot_token")
     if not isinstance(snapshot_token, str) or not snapshot_token:
