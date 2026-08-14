@@ -6,7 +6,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from browser_reuse.core import Observation, TaskSpec
-from browser_reuse.interfaces import ActionDispatchedError, Adapter
+from browser_reuse.interfaces import (
+    ActionDispatchedError,
+    ActionNotCommittedError,
+    Adapter,
+)
 from browser_reuse.llm import ChatModel, Message
 
 from .trajectory import ActionPlan, RecordedAction
@@ -70,6 +74,20 @@ def run_agent_loop(
                 )
             try:
                 adapter.execute(plan.execute_step)
+            except ActionNotCommittedError as action_error:
+                try:
+                    after = adapter.observe()
+                except Exception as observation_error:
+                    raise action_error from observation_error
+                observation = Observation(
+                    data={
+                        **after.data,
+                        "last_action_error": (
+                            f"{type(action_error).__name__}: {action_error}"
+                        ),
+                    }
+                )
+                continue
             except ActionDispatchedError as dispatched_error:
                 try:
                     after = adapter.observe()

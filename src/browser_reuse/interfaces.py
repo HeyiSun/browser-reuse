@@ -10,6 +10,10 @@ class ActionDispatchedError(RuntimeError):
     """The side effect returned, but post-action settling failed."""
 
 
+class ActionNotCommittedError(RuntimeError):
+    """A recoverable semantic action stopped before its commit point."""
+
+
 class Adapter(Protocol):
     def observe(self) -> Observation:
         ...

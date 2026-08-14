@@ -6,10 +6,11 @@ from collections.abc import Mapping
 from typing import Protocol
 
 from browser_reuse.core import Observation
-from browser_reuse.interfaces import ActionDispatchedError
+from browser_reuse.interfaces import ActionDispatchedError, ActionNotCommittedError
 
 from .actions import (
     BrowserAction,
+    ChooseComboboxOption,
     Click,
     Fill,
     SelectOption,
@@ -42,6 +43,10 @@ class _Locator(Protocol):
 
     def fill(self, value: str) -> None: ...
 
+    def element_handle(self) -> _ElementHandle | None: ...
+
+    def filter(self, *, visible: bool | None = None) -> _Locator: ...
+
     def get_attribute(self, name: str) -> str | None: ...
 
     def is_editable(self) -> bool: ...
@@ -51,6 +56,12 @@ class _Locator(Protocol):
     def is_visible(self) -> bool: ...
 
     def select_option(self, *, label: str) -> None: ...
+
+
+class _ElementHandle(Protocol):
+    def evaluate(self, expression: str, arg: object | None = None): ...
+
+    def fill(self, value: str) -> None: ...
 
 
 class _Page(Protocol):
@@ -125,12 +136,16 @@ class DomAxBrowserAdapter:
         )
 
     def execute(self, step: Mapping[str, object]) -> Mapping[str, object] | None:
-        """Dispatch once, then wait for a bounded quiet state.
+        """Execute one semantic step, then require a bounded quiet state.
 
         Live refs return ``None``. Durable replay returns the step pruned to the
-        locators confirmed in this capture. A settle error means the action may
-        already have happened.
+        locators confirmed in this capture. The editable-combobox step contains
+        one fill and one freshly grounded option click. A settle error means an
+        action may already have happened.
         """
+
+        if step.get("op") == "choose_combobox_option":
+            return self._execute_choose_combobox_option(step)
 
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
@@ -193,6 +208,184 @@ class DomAxBrowserAdapter:
         )
         _execute_locator(locator, step.get("op"), step)
         return action_to_step(_action_with_target(action, effective_target))
+
+    def _execute_choose_combobox_option(
+        self,
+        step: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        """Type, freshly ground one option, click once, then verify its commit."""
+
+        if set(step) != {"op", "target", "label"}:
+            raise ValueError("invalid choose_combobox_option action")
+        label = step.get("label")
+        target = step.get("target")
+        if not isinstance(label, str) or not label:
+            raise ValueError("choose_combobox_option requires a non-empty label")
+        if not isinstance(target, Mapping):
+            raise ValueError("choose_combobox_option requires a target mapping")
+
+        effective_target: DurableTarget | None
+        if target.get("by") == "ref":
+            if set(target) != {"by", "snapshot", "ref"}:
+                raise ValueError("invalid snapshot-ref target")
+            token = target.get("snapshot")
+            ref = target.get("ref")
+            if not isinstance(token, str) or not isinstance(ref, str):
+                raise ValueError("snapshot-ref target requires string identity")
+            field_locator = self._grounder.resolve_ref(
+                token,
+                ref,
+                "choose_combobox_option",
+            )
+            field_target = self._grounder.durable_target_for_ref(token, ref)
+            effective_target = None
+        else:
+            action = action_from_step(step)
+            if not isinstance(action, ChooseComboboxOption):
+                raise ValueError("invalid choose_combobox_option action")
+            field_locator, field_target = self._grounder.resolve_durable_target(
+                action.target,
+                "choose_combobox_option",
+                fallback_mode=self._locator_fallback,
+                candidate_provider=self._locator_candidate_provider,
+            )
+            effective_target = field_target
+
+        field_handle = field_locator.element_handle()
+        if field_handle is None:
+            raise ValueError("editable combobox has no live element handle")
+        original_value = _editable_value(field_locator)
+        try:
+            field_locator.fill(label)
+            self._wait_until_stable()
+            option_locator = self._grounder.resolve_fresh_option(label)
+        except Exception as exc:
+            try:
+                if field_target is None:
+                    restore_locator = field_handle
+                else:
+                    restore_locator, _ = self._grounder.resolve_durable_target(
+                        field_target,
+                        "choose_combobox_option",
+                        fallback_mode="stored_candidates",
+                    )
+                restore_locator.fill(original_value)
+                self._wait_until_stable()
+            except Exception as restore_error:
+                raise ActionDispatchedError(
+                    "combobox preparation failed and its prior value could not "
+                    "be restored"
+                ) from restore_error
+            raise ActionNotCommittedError(
+                "combobox option was not uniquely available before click"
+            ) from exc
+
+        # Once the option click is attempted, never click it again here. Any
+        # settle, fresh-field lookup, or readback uncertainty is post-dispatch.
+        try:
+            option_locator.click()
+            self._wait_until_stable()
+            if field_target is None:
+                readback_locator = field_handle
+                readback_target = None
+            else:
+                readback_locator, readback_target = (
+                    self._grounder.resolve_durable_target(
+                        field_target,
+                        "choose_combobox_option",
+                        fallback_mode=self._locator_fallback,
+                        candidate_provider=self._locator_candidate_provider,
+                    )
+                )
+            if not self._combobox_commit_matches(readback_locator, label):
+                raise ValueError("editable combobox has no matching commit evidence")
+        except Exception as exc:
+            raise ActionDispatchedError(
+                "combobox option click was dispatched but could not be verified"
+            ) from exc
+
+        if effective_target is None:
+            return None
+        if readback_target is None:
+            raise AssertionError("durable combobox replay lost its target")
+        return action_to_step(ChooseComboboxOption(readback_target, label))
+
+    def _combobox_commit_matches(
+        self,
+        field: _Locator | _ElementHandle,
+        label: str,
+    ) -> bool:
+        """Accept exact field, selected-option, hidden-value, or pill evidence."""
+
+        evidence = field.evaluate(
+            """(element, expected) => {
+                const normalize = value => String(value || '')
+                    .replace(/\\s+/g, ' ').trim();
+                const wanted = normalize(expected);
+                const value = 'value' in element
+                    ? normalize(element.value)
+                    : normalize(element.textContent);
+                const expandedOwner = element.hasAttribute('aria-expanded')
+                    ? element
+                    : element.closest('[aria-expanded]');
+                const expanded = expandedOwner
+                    ? expandedOwner.getAttribute('aria-expanded')
+                    : null;
+                let relatedExact = false;
+                let scope = element.parentElement;
+                for (let depth = 0; scope && depth < 4 && !relatedExact; depth++) {
+                    const candidates = Array.from(scope.querySelectorAll('*')).slice(0, 200);
+                    for (const candidate of candidates) {
+                        if (candidate === element || candidate.contains(element)) continue;
+                        if (candidate.closest('[role="listbox"], [role="option"]')) continue;
+                        const hiddenInput = candidate.matches('input[type="hidden"]');
+                        if (!hiddenInput) {
+                            const rect = candidate.getBoundingClientRect();
+                            const style = getComputedStyle(candidate);
+                            if (rect.width === 0 || rect.height === 0 ||
+                                style.display === 'none' || style.visibility === 'hidden' ||
+                                Number(style.opacity) < 0.05) continue;
+                        }
+                        const values = [
+                            candidate.textContent,
+                            candidate.getAttribute('aria-label'),
+                            candidate.getAttribute('title'),
+                            candidate.getAttribute('data-value'),
+                        ];
+                        if (hiddenInput) {
+                            values.push(candidate.value);
+                        }
+                        if (values.some(item => normalize(item) === wanted)) {
+                            relatedExact = true;
+                            break;
+                        }
+                    }
+                    scope = scope.parentElement;
+                }
+                return {value, expanded, relatedExact};
+            }""",
+            label,
+        )
+        if not isinstance(evidence, Mapping):
+            return False
+        wanted = _normalize_text(label)
+        value_matches = _normalize_text(evidence.get("value")) == wanted
+        related_matches = evidence.get("relatedExact") is True
+        exact_options = self._page.get_by_role(
+            "option",
+            name=label,
+            exact=True,
+        )
+        visible_options = exact_options.filter(visible=True)
+        selected_matches = (
+            visible_options.count() == 1
+            and visible_options.get_attribute("aria-selected") == "true"
+        )
+        menu_closed = (
+            evidence.get("expanded") == "false"
+            or visible_options.count() == 0
+        )
+        return related_matches or selected_matches or (value_matches and menu_closed)
 
     def _wait_until_stable(self) -> None:
         """Wait for both non-streaming requests and DOM revisions to go quiet."""
@@ -264,4 +457,25 @@ def _action_with_target(
         return Click(target)
     if isinstance(action, Fill):
         return Fill(target, action.value)
-    return SelectOption(target, action.label)
+    if isinstance(action, SelectOption):
+        return SelectOption(target, action.label)
+    return ChooseComboboxOption(target, action.label)
+
+
+def _editable_value(locator: _Locator | _ElementHandle) -> str:
+    """Read the current text from a native or contenteditable combobox."""
+
+    value = locator.evaluate(
+        """element => {
+            if ('value' in element) return String(element.value || '');
+            if (element.isContentEditable) return element.textContent || '';
+            return '';
+        }"""
+    )
+    return value if isinstance(value, str) else ""
+
+
+def _normalize_text(value: object) -> str:
+    """Compare browser readback without treating harmless whitespace as drift."""
+
+    return " ".join(str(value or "").split())

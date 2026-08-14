@@ -59,7 +59,12 @@ def _reject_transient_browser_identity(step: Mapping[str, object]) -> None:
 
 
 def _validate_browser_action_schema(step: Mapping[str, object]) -> None:
-    if step.get("op") not in {"click", "fill", "select_option"}:
+    if step.get("op") not in {
+        "click",
+        "fill",
+        "select_option",
+        "choose_combobox_option",
+    }:
         return
     from browser_reuse.browser.actions import action_from_step
 

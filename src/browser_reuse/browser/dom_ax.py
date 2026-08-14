@@ -323,6 +323,7 @@ class DomAxGrounder:
         self._marker_attribute: str | None = None
         self._loader_id: str | None = None
         self._bindings: dict[str, _RefBinding] = {}
+        self._targets_by_ref: dict[str, DurableTarget] = {}
         self._actionable_nodes: tuple[_ActionableNode, ...] = ()
 
     def capture(self) -> BrowserSnapshot:
@@ -449,9 +450,10 @@ class DomAxGrounder:
 
         frozen_actionable_nodes = tuple(actionable_nodes)
         self._actionable_nodes = frozen_actionable_nodes
+        targets_by_ref: dict[str, DurableTarget] = {}
         if include_targets:
             try:
-                self._attach_durable_targets(
+                targets_by_ref = self._attach_durable_targets(
                     controls,
                     frozen_actionable_nodes,
                 )
@@ -509,6 +511,7 @@ class DomAxGrounder:
         self._marker_attribute = marker_attribute
         self._loader_id = loader_before
         self._bindings = bindings
+        self._targets_by_ref = targets_by_ref
         return BrowserSnapshot(
             text=text,
             controls=controls,
@@ -589,13 +592,46 @@ class DomAxGrounder:
             raise ValueError("browser ref is no longer actionable")
         if operation == "click" and not _receives_pointer_events(locator):
             raise ValueError("browser ref is obscured by another element")
-        if operation == "fill" and not locator.is_editable():
+        if (
+            operation in {"fill", "choose_combobox_option"}
+            and not locator.is_editable()
+        ):
             raise ValueError("browser ref is no longer editable")
         if operation == "select_option":
             labels = _select_labels(locator)
             if labels != binding.labels or label is None or labels.count(label) != 1:
                 raise ValueError("browser select options changed after observation")
         return locator
+
+    def durable_target_for_ref(
+        self,
+        token: str,
+        ref: str,
+    ) -> DurableTarget | None:
+        """Return a ref's optional recipe target without requiring compilation."""
+
+        if token != self._token:
+            raise ValueError("browser ref belongs to a stale observation")
+        if ref not in self._bindings:
+            raise ValueError("browser ref is not present in the observation")
+        return self._targets_by_ref.get(ref)
+
+    def resolve_fresh_option(self, label: str) -> _Locator:
+        """Freshly capture and resolve one exact witnessed custom option."""
+
+        snapshot = self.capture()
+        matches = [
+            ref
+            for ref, binding in self._bindings.items()
+            if binding.operation == "click"
+            and binding.role == "option"
+            and binding.name == label
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "editable combobox requires one fresh exact witnessed option"
+            )
+        return self.resolve_ref(snapshot.token, matches[0], "click")
 
     def _render_ax_node(
         self,
@@ -776,7 +812,10 @@ class DomAxGrounder:
             locator.count() != 1
             or not locator.is_visible()
             or not locator.is_enabled()
-            or (operation == "fill" and not locator.is_editable())
+            or (
+                operation in {"fill", "choose_combobox_option"}
+                and not locator.is_editable()
+            )
             or (operation == "click" and not _receives_pointer_events(locator))
         ):
             _remove_marker(session, backend_id, marker)
@@ -791,7 +830,7 @@ class DomAxGrounder:
         public_state = _public_dom_state(dom_node.attributes)
         if public_state:
             control["state"] = public_state
-        if operation == "fill" and not secret:
+        if operation in {"fill", "choose_combobox_option"} and not secret:
             control["value"] = _editable_value(locator)
         elif operation == "select_option":
             if secret:
@@ -854,9 +893,10 @@ class DomAxGrounder:
         self,
         controls: dict[str, dict[str, object]],
         nodes: tuple[_ActionableNode, ...],
-    ) -> None:
+    ) -> dict[str, DurableTarget]:
         """Attach targets independently; a usable ref may remain non-compilable."""
 
+        targets: dict[str, DurableTarget] = {}
         for node in nodes:
             try:
                 target = self._build_durable_target(
@@ -867,6 +907,8 @@ class DomAxGrounder:
                 target = None
             if target is not None:
                 controls[node.ref]["target"] = action_to_step(Click(target))["target"]
+                targets[node.ref] = target
+        return targets
 
     def _build_durable_target(
         self,
@@ -1047,6 +1089,7 @@ class DomAxGrounder:
         self._marker_attribute = None
         self._loader_id = None
         self._bindings = {}
+        self._targets_by_ref = {}
         self._actionable_nodes = ()
 
 
@@ -1521,7 +1564,7 @@ def _backend_ids_with_marker(
 
 def _operation(role: str, tag: str, dom_clickable: bool = False) -> str | None:
     if role == "combobox":
-        return "select_option" if tag == "select" else "fill"
+        return "select_option" if tag == "select" else "choose_combobox_option"
     if role in _FILL_ROLES:
         return "fill"
     if role in _CLICK_ROLES and tag != "option":

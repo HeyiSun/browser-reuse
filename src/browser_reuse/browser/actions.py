@@ -50,7 +50,20 @@ class SelectOption:
             raise ValueError("select option label must not be empty")
 
 
-BrowserAction: TypeAlias = Click | Fill | SelectOption
+@dataclass(frozen=True)
+class ChooseComboboxOption:
+    """Choose one exact option from an editable, non-native combobox."""
+
+    target: BrowserTarget
+    label: str
+
+    def __post_init__(self) -> None:
+        _validate_target(self.target)
+        if not isinstance(self.label, str) or not self.label:
+            raise ValueError("combobox option label must not be empty")
+
+
+BrowserAction: TypeAlias = Click | Fill | SelectOption | ChooseComboboxOption
 
 
 def action_to_step(action: BrowserAction) -> dict[str, object]:
@@ -61,7 +74,13 @@ def action_to_step(action: BrowserAction) -> dict[str, object]:
         return {"op": "click", "target": target}
     if isinstance(action, Fill):
         return {"op": "fill", "target": target, "value": action.value}
-    return {"op": "select_option", "target": target, "label": action.label}
+    if isinstance(action, SelectOption):
+        return {"op": "select_option", "target": target, "label": action.label}
+    return {
+        "op": "choose_combobox_option",
+        "target": target,
+        "label": action.label,
+    }
 
 
 def action_from_step(step: Mapping[str, object]) -> BrowserAction:
@@ -72,6 +91,7 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
         "click": {"op", "target"},
         "fill": {"op", "target", "value"},
         "select_option": {"op", "target", "label"},
+        "choose_combobox_option": {"op", "target", "label"},
     }
     if operation not in expected_keys or set(step) != expected_keys[operation]:
         raise ValueError(f"invalid browser action fields: {operation!r}")
@@ -85,8 +105,10 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
         return Fill(target, value)
     label = step.get("label")
     if not isinstance(label, str) or not label:
-        raise ValueError("select_option requires a non-empty label")
-    return SelectOption(target, label)
+        raise ValueError(f"{operation} requires a non-empty label")
+    if operation == "select_option":
+        return SelectOption(target, label)
+    return ChooseComboboxOption(target, label)
 
 
 def _validate_target(target: object) -> None:
