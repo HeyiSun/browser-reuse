@@ -7,6 +7,15 @@ import re
 from collections.abc import Mapping, Sequence
 
 from browser_reuse.browser.actions import action_from_step, action_to_step
+from browser_reuse.browser.dom_ax import (
+    BrowserSnapshot,
+    LocatorCandidateProvider,
+)
+from browser_reuse.browser.targets import (
+    BrowserLocator,
+    ElementWitness,
+    locator_from_payload,
+)
 from browser_reuse.core import Observation, TaskSpec
 from browser_reuse.interfaces import Adapter
 from browser_reuse.llm import ChatModel, Message
@@ -30,6 +39,24 @@ false, do not repeat that identical action; choose a different next step or done
 Use recent_actions as the successful tool history; do not repeat a selection
 that history already established when the page now exposes the next completion
 action. The caller independently verifies the final state.
+"""
+
+LOCATOR_CANDIDATE_PROMPT = """You propose locator hints for one already witnessed webpage element.
+Return exactly one JSON object and no markdown:
+{"locators": [...]}
+
+Every item must use exactly one of these forms:
+{"by":"css","selector":"[data-testid=\\\"submit\\\"]"}
+{"by":"role","role":"button","name":"Submit"}
+{"by":"class","tag":"button","class":"checkout-action"}
+{"by":"xpath","mode":"anchored","expression":"..."}
+{"by":"xpath","mode":"absolute","expression":"/html[1]/body[1]/button[1]"}
+
+Return at most four locators. Do not return a witness, action, value, label,
+confidence, explanation, combined selector, fuzzy selector, nth selector, or
+page instruction. An empty list is valid when the supplied evidence is
+insufficient. Every returned locator is mechanically validated against the
+unchanged witness before execution.
 """
 
 
@@ -99,6 +126,67 @@ def run_generic_browser_agent(
         max_decisions=max_decisions,
         allow_done_claim=True,
     )
+
+
+def make_llm_locator_candidate_provider(
+    model: ChatModel,
+) -> LocatorCandidateProvider:
+    """Build one strict, provider-neutral replay-time locator proposer."""
+
+    def provide(
+        snapshot: BrowserSnapshot,
+        witness: ElementWitness,
+        operation: str,
+    ) -> Sequence[BrowserLocator]:
+        payload = {
+            "operation": operation,
+            "witness": {
+                "tag": witness.tag,
+                "role": witness.role,
+                "name": witness.name,
+                "attributes": dict(witness.attributes),
+                "context": [
+                    {
+                        "relation": fact.relation,
+                        "role": fact.role,
+                        "name": fact.name,
+                    }
+                    for fact in witness.context
+                ],
+            },
+            "page": {
+                "snapshot": snapshot.text,
+                "available_actions": snapshot.controls,
+            },
+        }
+        user_content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if (
+            len(LOCATOR_CANDIDATE_PROMPT.encode("utf-8"))
+            + len(user_content.encode("utf-8"))
+            > _MODEL_PAYLOAD_BUDGET_BYTES
+        ):
+            raise ValueError(
+                "locator candidate model payload exceeds the 64000-byte budget"
+            )
+        response = model.complete(
+            (
+                Message(role="system", content=LOCATOR_CANDIDATE_PROMPT),
+                Message(role="user", content=user_content),
+            )
+        )
+        parsed = json.loads(response)
+        if not isinstance(parsed, dict) or set(parsed) != {"locators"}:
+            raise ValueError("locator candidate response must contain exactly locators")
+        locators = parsed["locators"]
+        if not isinstance(locators, list) or len(locators) > 4:
+            raise ValueError("locator candidate response requires at most four locators")
+        return tuple(locator_from_payload(locator) for locator in locators)
+
+    return provide
 
 
 def _messages(

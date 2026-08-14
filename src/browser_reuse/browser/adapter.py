@@ -16,7 +16,12 @@ from .actions import (
     action_from_step,
     action_to_step,
 )
-from .dom_ax import DOM_REVISION_SCRIPT, DomAxGrounder
+from .dom_ax import (
+    DOM_REVISION_SCRIPT,
+    DomAxGrounder,
+    LocatorCandidateProvider,
+    LocatorFallbackMode,
+)
 from .targets import DurableTarget
 
 
@@ -76,9 +81,26 @@ class DomAxBrowserAdapter:
         page: _Page,
         *,
         grounder: DomAxGrounder | None = None,
+        locator_fallback: LocatorFallbackMode = "stored_candidates",
+        locator_candidate_provider: LocatorCandidateProvider | None = None,
     ) -> None:
+        if locator_fallback not in {
+            "none",
+            "stored_candidates",
+            "stored_then_llm",
+        }:
+            raise ValueError(f"unknown locator fallback mode: {locator_fallback!r}")
+        if (
+            locator_fallback == "stored_then_llm"
+            and locator_candidate_provider is None
+        ):
+            raise ValueError(
+                "stored_then_llm requires a locator candidate provider"
+            )
         self._page = page
         self._grounder = grounder or DomAxGrounder(page)  # type: ignore[arg-type]
+        self._locator_fallback = locator_fallback
+        self._locator_candidate_provider = locator_candidate_provider
         # Streaming requests never settle, so the callbacks exclude them.
         self._pending_requests: set[object] = set()
         on = getattr(page, "on", None)
@@ -166,6 +188,8 @@ class DomAxBrowserAdapter:
             action.target,
             step.get("op", ""),
             label=label,
+            fallback_mode=self._locator_fallback,
+            candidate_provider=self._locator_candidate_provider,
         )
         _execute_locator(locator, step.get("op"), step)
         return action_to_step(_action_with_target(action, effective_target))

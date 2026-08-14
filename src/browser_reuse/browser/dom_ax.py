@@ -8,17 +8,19 @@ import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .actions import Click, action_to_step
 from .targets import (
     BrowserLocator,
+    ClassLocator,
     ContextFact,
     CssLocator,
     DurableTarget,
     ElementWitness,
     RoleLocator,
     XPathLocator,
+    is_admissible_class_token,
     looks_generated_id,
 )
 
@@ -199,6 +201,17 @@ class BrowserSnapshot:
     diagnostics: Mapping[str, object]
 
 
+LocatorFallbackMode = Literal[
+    "none",
+    "stored_candidates",
+    "stored_then_llm",
+]
+LocatorCandidateProvider = Callable[
+    [BrowserSnapshot, ElementWitness, str],
+    Sequence[BrowserLocator],
+]
+
+
 @dataclass(frozen=True)
 class _DomNode:
     """DOM facts indexed by Chromium backend node identity."""
@@ -229,6 +242,7 @@ class _ActionableNode:
     backend_id: int
     tag: str
     attributes: Mapping[str, str]
+    class_name: str | None
     role: str
     name: str
     operation: str
@@ -816,6 +830,9 @@ class DomAxGrounder:
                     dom_node.attributes,
                     exclude_textual=secret,
                 ),
+                class_name=_first_admissible_class(
+                    dom_node.attributes.get("class", "")
+                ),
                 role=role,
                 name=name if public_name == name else "",
                 operation=operation,
@@ -865,24 +882,34 @@ class DomAxGrounder:
         if [match.backend_id for match in witness_matches] != [node.backend_id]:
             return None
 
+        admitted = self._confirm_locator_candidates(
+            _candidate_locators(node, witness),
+            node,
+        )
+        if not admitted:
+            return None
+        return DurableTarget(admitted, witness)
+
+    def _confirm_locator_candidates(
+        self,
+        candidates: Sequence[BrowserLocator],
+        intended: _ActionableNode,
+    ) -> tuple[BrowserLocator, ...]:
+        """Admit typed hints only when they still include the witnessed node."""
+
         admitted: list[BrowserLocator] = []
         admitted_slots: set[str] = set()
-        for locator in _candidate_locators(node, witness):
+        for locator in sorted(candidates, key=_locator_order_key):
             slot = _locator_slot(locator)
             if slot in admitted_slots:
                 continue
             raw_backend_ids = self._resolve_locator_backend_ids(locator)
-            confirmed = {
-                match.backend_id
-                for match in witness_matches
-                if match.backend_id in raw_backend_ids
-            }
-            if confirmed == {node.backend_id}:
+            if intended.backend_id in raw_backend_ids:
                 admitted.append(locator)
                 admitted_slots.add(slot)
-        if not admitted:
-            return None
-        return DurableTarget(tuple(admitted), witness)
+                if len(admitted) == 4:
+                    break
+        return tuple(admitted)
 
     def _select_witness(
         self,
@@ -945,6 +972,10 @@ class DomAxGrounder:
             )
         if isinstance(locator, CssLocator):
             page_locator = self._page.locator(locator.selector)
+        elif isinstance(locator, ClassLocator):
+            page_locator = self._page.locator(
+                f"{locator.tag}.{locator.class_name}"
+            )
         elif isinstance(locator, XPathLocator):
             page_locator = self._page.locator(f"xpath={locator.expression}")
         else:
@@ -957,8 +988,19 @@ class DomAxGrounder:
         operation: str,
         *,
         label: str | None = None,
+        fallback_mode: LocatorFallbackMode = "stored_candidates",
+        candidate_provider: LocatorCandidateProvider | None = None,
     ) -> tuple[_Locator, DurableTarget]:
-        """Preflight every candidate on a fresh capture before returning one node."""
+        """Resolve configured hints against one fresh, unique witnessed node."""
+
+        if fallback_mode not in {
+            "none",
+            "stored_candidates",
+            "stored_then_llm",
+        }:
+            raise ValueError(f"unknown locator fallback mode: {fallback_mode!r}")
+        if fallback_mode == "stored_then_llm" and candidate_provider is None:
+            raise ValueError("stored_then_llm requires a locator candidate provider")
 
         snapshot = self._capture(include_targets=False)
         witness_matches = _matching_nodes(self._actionable_nodes, target.witness)
@@ -966,24 +1008,26 @@ class DomAxGrounder:
             raise ValueError("durable target witness is no longer unique")
         intended = witness_matches[0]
 
-        confirmed = []
-        confirmed_backend_ids: set[int] = set()
-        for locator in target.locators:
-            raw_backend_ids = self._resolve_locator_backend_ids(locator)
-            matches = {
-                node.backend_id
-                for node in witness_matches
-                if node.backend_id in raw_backend_ids
-            }
-            if len(matches) > 1:
-                raise ValueError("durable locator conflicts with its witness")
-            if matches:
-                confirmed.append(locator)
-                confirmed_backend_ids.update(matches)
+        stored_candidates = (
+            target.locators[:1] if fallback_mode == "none" else target.locators
+        )
+        confirmed = self._confirm_locator_candidates(stored_candidates, intended)
+        if not confirmed and fallback_mode == "stored_then_llm":
+            assert candidate_provider is not None
+            proposed = tuple(
+                candidate_provider(snapshot, target.witness, operation)
+            )
+            if not all(
+                isinstance(
+                    locator,
+                    (CssLocator, RoleLocator, ClassLocator, XPathLocator),
+                )
+                for locator in proposed
+            ):
+                raise ValueError("locator candidate provider returned an untyped locator")
+            confirmed = self._confirm_locator_candidates(proposed, intended)
         if not confirmed:
             raise ValueError("no durable locator confirms the witnessed target")
-        if confirmed_backend_ids != {intended.backend_id}:
-            raise ValueError("durable locators resolve to conflicting targets")
 
         locator = self.resolve_ref(
             snapshot.token,
@@ -991,7 +1035,7 @@ class DomAxGrounder:
             operation,
             label=label,
         )
-        return locator, DurableTarget(tuple(confirmed), target.witness)
+        return locator, DurableTarget(confirmed, target.witness)
 
     def _remove_previous_markers(self) -> None:
         """Remove the previous snapshot's DOM markers and in-memory identity."""
@@ -1219,6 +1263,8 @@ def _candidate_locators(
             continue
 
     locators.append(RoleLocator(node.role, node.name))
+    if node.class_name is not None:
+        locators.append(ClassLocator(node.tag, node.class_name))
     anchored = _anchored_xpath(node, witness)
     if anchored is not None:
         try:
@@ -1235,7 +1281,21 @@ def _locator_slot(locator: BrowserLocator) -> str:
         return "css"
     if isinstance(locator, RoleLocator):
         return "role"
+    if isinstance(locator, ClassLocator):
+        return "class"
     return f"xpath:{locator.mode}"
+
+
+def _locator_order_key(locator: BrowserLocator) -> int:
+    """Keep provider and stored hints in the target codec's canonical order."""
+
+    if isinstance(locator, CssLocator):
+        return 0
+    if isinstance(locator, RoleLocator):
+        return 1
+    if isinstance(locator, ClassLocator):
+        return 2
+    return 3 if locator.mode == "anchored" else 4
 
 
 def _anchored_xpath(
@@ -1676,6 +1736,15 @@ def _is_secret(attributes: Mapping[str, str], accessible_name: str) -> bool:
         )
     )
     return _SECRET_TEXT.search(hints) is not None
+
+
+def _first_admissible_class(value: str) -> str | None:
+    """Return one filtered class hint without promoting it to witness evidence."""
+
+    return next(
+        (token for token in value.split() if is_admissible_class_token(token)),
+        None,
+    )
 
 
 def _public_dom_state(attributes: Mapping[str, str]) -> dict[str, str]:
