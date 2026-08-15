@@ -120,6 +120,9 @@ _CONTEXT_ANCESTOR_ROLES = frozenset(
 _MAX_SELECT_OPTIONS = 40
 _MAX_CONTROLS = 200
 _MAX_SNAPSHOT_BYTES = 64_000
+_CLASS_HINT_WORDS = frozenset(
+    {"checked", "closed", "disabled", "error", "loading", "open", "selected"}
+)
 # Secret hints only control conservative redaction; they never identify nodes.
 _SECRET_AUTOCOMPLETE = frozenset(
     {
@@ -315,7 +318,7 @@ class DomAxGrounder:
         page: _Page,
         *,
         witness_fact_selector: WitnessFactSelector | None = None,
-        include_raw_class: bool = True,
+        include_raw_class: bool = False,
     ) -> None:
         self._page = page
         self._witness_fact_selector = witness_fact_selector
@@ -1807,8 +1810,25 @@ def _public_dom_state(
         value = attributes.get(key)
         if value:
             state[key] = value[:100]
+    class_hints = _class_state_hints(attributes.get("class", ""))
+    if class_hints:
+        state["class_hints"] = ",".join(class_hints)
     if include_raw_class:
         class_name = attributes.get("class", "").strip()
         if class_name:
             state["class"] = class_name[:200]
     return state
+
+
+def _class_state_hints(value: str) -> tuple[str, ...]:
+    """Extract bounded state hints without exposing framework class strings."""
+
+    hints: set[str] = set()
+    for token in value.split():
+        # Tailwind-style hover:/focus: variants describe a possible style, not
+        # the element's current state.
+        if ":" in token:
+            continue
+        words = {word for word in re.split(r"[-_]", token.casefold()) if word}
+        hints.update(words & _CLASS_HINT_WORDS)
+    return tuple(sorted(hints))

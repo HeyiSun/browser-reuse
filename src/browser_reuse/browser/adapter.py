@@ -94,7 +94,7 @@ class DomAxBrowserAdapter:
         grounder: DomAxGrounder | None = None,
         locator_fallback: LocatorFallbackMode = "stored_candidates",
         locator_candidate_provider: LocatorCandidateProvider | None = None,
-        include_raw_class: bool = True,
+        include_raw_class: bool = False,
     ) -> None:
         if locator_fallback not in {
             "none",
