@@ -116,6 +116,7 @@ _CONTEXT_ANCESTOR_ROLES = frozenset(
         "tabpanel",
     }
 )
+_READBACK_ROLES = frozenset({"alert", "dialog", "heading", "status"})
 # These budgets fail closed before an oversized snapshot reaches the model.
 _MAX_SELECT_OPTIONS = 40
 _MAX_CONTROLS = 200
@@ -202,6 +203,7 @@ class BrowserSnapshot:
     controls: Mapping[str, Mapping[str, object]]
     token: str
     diagnostics: Mapping[str, object]
+    readback_facts: tuple[tuple[str, str], ...] = ()
 
 
 LocatorFallbackMode = Literal[
@@ -408,6 +410,7 @@ class DomAxGrounder:
                 for node in ax_nodes
                 if isinstance(node, Mapping) and node.get("nodeId") is not None
             }
+            readback_facts = _readback_facts(ax_by_id.values())
             child_ids = {
                 str(child_id)
                 for node in ax_by_id.values()
@@ -522,7 +525,41 @@ class DomAxGrounder:
             controls=controls,
             token=token,
             diagnostics=diagnostics,
+            readback_facts=readback_facts,
         )
+
+    def semantic_fact_count(self, role: str, name: str) -> int:
+        """Count one exact named AX fact without publishing browser refs."""
+
+        if role not in _READBACK_ROLES or not name:
+            raise ValueError("unsupported semantic readback fact")
+        session = self._page.context.new_cdp_session(self._page)
+        try:
+            session.send("Page.enable")
+            session.send("Accessibility.enable")
+            frame_id, loader_before = _main_frame_identity(session)
+            result = session.send(
+                "Accessibility.getFullAXTree",
+                {"frameId": frame_id},
+            )
+            _, loader_after = _main_frame_identity(session)
+            if loader_before != loader_after:
+                raise RuntimeError("document changed while reading click outcome")
+            nodes = result.get("nodes")
+            if not isinstance(nodes, list):
+                raise RuntimeError("CDP returned an invalid AX readback")
+            return sum(
+                1
+                for node in nodes
+                if isinstance(node, Mapping)
+                and isinstance(node.get("backendDOMNodeId"), int)
+                and not isinstance(node.get("backendDOMNodeId"), bool)
+                and not _ax_ignored(node)
+                and _ax_text(node.get("role")).lower() == role
+                and _ax_text(node.get("name")) == name
+            )
+        finally:
+            session.detach()
 
     def resolve_ref(
         self,
@@ -1696,6 +1733,26 @@ def _ax_text(value: object) -> str:
     if text is None:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def _readback_facts(
+    nodes: Sequence[Mapping[str, object]],
+) -> tuple[tuple[str, str], ...]:
+    """Keep the small named AX roles allowed as click outcome evidence."""
+
+    facts: list[tuple[str, str]] = []
+    for node in nodes:
+        role = _ax_text(node.get("role")).lower()
+        name = _ax_text(node.get("name"))
+        if (
+            role in _READBACK_ROLES
+            and name
+            and isinstance(node.get("backendDOMNodeId"), int)
+            and not isinstance(node.get("backendDOMNodeId"), bool)
+            and not _ax_ignored(node)
+        ):
+            facts.append((role, name))
+    return tuple(facts)
 
 
 def _ax_ignored(node: Mapping[str, object]) -> bool:

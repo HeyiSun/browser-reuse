@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 
-from browser_reuse.browser.actions import action_from_step, action_to_step
+from browser_reuse.browser.actions import (
+    Appears,
+    Click,
+    action_from_step,
+    action_to_step,
+)
 from browser_reuse.browser.dom_ax import (
     BrowserSnapshot,
     LocatorCandidateProvider,
@@ -21,7 +27,7 @@ from browser_reuse.interfaces import Adapter
 from browser_reuse.llm import ChatModel, Message
 
 from .loop import AgentRun, run_agent_loop
-from .trajectory import ActionPlan
+from .trajectory import ActionPlan, RecordedAction
 
 
 GENERIC_BROWSER_PROMPT = """You operate a webpage from a public DOM+accessibility snapshot.
@@ -125,7 +131,7 @@ def run_generic_browser_agent(
             public_state_before_action = _public_state(observation)
         return step
 
-    return run_agent_loop(
+    run = run_agent_loop(
         task,
         adapter,
         model,
@@ -135,6 +141,102 @@ def run_generic_browser_agent(
         max_decisions=max_decisions,
         allow_done_claim=True,
     )
+    return _attach_click_readbacks(run)
+
+
+def _attach_click_readbacks(run: AgentRun) -> AgentRun:
+    """Add one observed exact Appears condition to eligible click records."""
+
+    actions: list[RecordedAction] = []
+    for record in run.actions:
+        readback = _new_appeared_fact(record.before, record.after)
+        click = _recorded_click(record)
+        if readback is None or click is None:
+            actions.append(record)
+            continue
+        actions.append(
+            RecordedAction(
+                execute_step=record.execute_step,
+                recipe_step=action_to_step(Click(click.target, readback)),
+                before=record.before,
+                after=record.after,
+            )
+        )
+    return AgentRun(
+        claimed_success=run.claimed_success,
+        actions=tuple(actions),
+        decisions=run.decisions,
+        error=run.error,
+        last_response=run.last_response,
+    )
+
+
+def _recorded_click(record: RecordedAction) -> Click | None:
+    """Recover a durable click from its recipe step or source ref control."""
+
+    candidate = record.recipe_step
+    if candidate is None and record.execute_step.get("op") == "click":
+        target = record.execute_step.get("target")
+        ref = target.get("ref") if isinstance(target, Mapping) else None
+        controls = record.before.data.get("controls")
+        control = (
+            controls.get(ref)
+            if isinstance(controls, Mapping) and isinstance(ref, str)
+            else None
+        )
+        durable_target = (
+            control.get("target") if isinstance(control, Mapping) else None
+        )
+        if isinstance(durable_target, Mapping):
+            candidate = {"op": "click", "target": durable_target}
+    if candidate is None:
+        return None
+    try:
+        action = action_from_step(candidate)
+    except ValueError:
+        return None
+    return action if isinstance(action, Click) else None
+
+
+def _new_appeared_fact(
+    before: Observation,
+    after: Observation | None,
+) -> Appears | None:
+    """Select one unique named AX fact absent before and present after."""
+
+    if after is None:
+        return None
+    before_counts = _readback_fact_counts(before)
+    after_counts = _readback_fact_counts(after)
+    rank = {"heading": 0, "alert": 1, "status": 2, "dialog": 3}
+    candidates = [
+        fact
+        for fact, count in after_counts.items()
+        if count == 1 and before_counts[fact] == 0 and fact[0] in rank
+    ]
+    if not candidates:
+        return None
+    role, name = min(candidates, key=lambda fact: (rank[fact[0]], fact[1]))
+    return Appears(role, name)
+
+
+def _readback_fact_counts(
+    observation: Observation,
+) -> Counter[tuple[str, str]]:
+    """Count only well-formed internal AX facts from one observation."""
+
+    facts: Counter[tuple[str, str]] = Counter()
+    value = observation.data.get("readback_facts", ())
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return facts
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        role = item.get("role")
+        name = item.get("name")
+        if isinstance(role, str) and isinstance(name, str) and role and name:
+            facts[(role, name)] += 1
+    return facts
 
 
 def make_llm_locator_candidate_provider(

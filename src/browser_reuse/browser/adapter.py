@@ -9,6 +9,7 @@ from browser_reuse.core import Observation
 from browser_reuse.interfaces import ActionDispatchedError, ActionNotCommittedError
 
 from .actions import (
+    Appears,
     BrowserAction,
     ChooseComboboxOption,
     Click,
@@ -140,6 +141,10 @@ class DomAxBrowserAdapter:
                 "snapshot_token": snapshot.token,
                 "controls": snapshot.controls,
                 "diagnostics": snapshot.diagnostics,
+                "readback_facts": [
+                    {"role": role, "name": name}
+                    for role, name in snapshot.readback_facts
+                ],
             }
         )
 
@@ -157,9 +162,24 @@ class DomAxBrowserAdapter:
 
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
+        click_readback: Appears | None = None
         if isinstance(target, Mapping) and target.get("by") == "ref":
             locator = self._execute_ref_step(step, target)
         else:
+            action = action_from_step(step)
+            if isinstance(action, Click):
+                click_readback = action.readback
+                if (
+                    click_readback is not None
+                    and self._grounder.semantic_fact_count(
+                        click_readback.role,
+                        click_readback.name,
+                    )
+                    != 0
+                ):
+                    raise ValueError(
+                        "click readback already holds before dispatch"
+                    )
             locator, effective_step = self._execute_durable_step(step)
 
         operation = step.get("op")
@@ -170,6 +190,19 @@ class DomAxBrowserAdapter:
                 return effective_step
             raise ActionDispatchedError(
                 f"{operation} was dispatched but field readback was unresolved"
+            )
+
+        if click_readback is not None:
+            if self._wait_for_readback(
+                lambda: self._grounder.semantic_fact_count(
+                    click_readback.role,
+                    click_readback.name,
+                )
+                == 1
+            ):
+                return effective_step
+            raise ActionDispatchedError(
+                "click was dispatched but semantic readback was unresolved"
             )
 
         try:
@@ -544,7 +577,7 @@ def _action_with_target(
     """Replace an action target with the candidates confirmed during replay."""
 
     if isinstance(action, Click):
-        return Click(target)
+        return Click(target, action.readback)
     if isinstance(action, Fill):
         return Fill(target, action.value)
     if isinstance(action, SelectOption):
