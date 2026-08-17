@@ -95,24 +95,27 @@ def run_agent_loop(
                     actions.append(
                         RecordedAction(
                             execute_step=dict(plan.execute_step),
-                            recipe_step=(
-                                dict(plan.recipe_step)
-                                if plan.recipe_step is not None
-                                else None
-                            ),
+                            recipe_step=None,
                             before=observation,
                             after=None,
                         )
                     )
                     raise dispatched_error from observation_error
+                after = Observation(
+                    data={
+                        **after.data,
+                        "last_action_error": (
+                            f"{type(dispatched_error).__name__}: "
+                            f"{dispatched_error}"
+                        ),
+                    }
+                )
                 actions.append(
                     RecordedAction(
                         execute_step=dict(plan.execute_step),
-                        recipe_step=(
-                            dict(plan.recipe_step)
-                            if plan.recipe_step is not None
-                            else None
-                        ),
+                        # A dispatched action is useful trajectory evidence,
+                        # but cannot enter a recipe until readback confirms it.
+                        recipe_step=None,
                         before=observation,
                         after=after,
                     )

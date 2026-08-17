@@ -7,7 +7,7 @@ from .core import Observation, TaskSpec
 
 
 class ActionDispatchedError(RuntimeError):
-    """The side effect returned, but post-action settling failed."""
+    """The action was dispatched, but its expected effect is unresolved."""
 
 
 class ActionNotCommittedError(RuntimeError):
@@ -22,7 +22,7 @@ class Adapter(Protocol):
         self,
         step: Mapping[str, object],
     ) -> Mapping[str, object] | None:
-        """Execute one step and optionally return the canonical effective step."""
+        """Execute and confirm one step, optionally returning its effective form."""
 
         ...
 

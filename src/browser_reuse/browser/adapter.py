@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Protocol
 
 from browser_reuse.core import Observation
@@ -32,6 +32,8 @@ _POLL_MS = 200
 _MIN_POLLS = 3
 _STABLE_MATCHES = 2
 _MAX_POLLS = 40
+_READBACK_STABLE_MATCHES = 2
+_READBACK_MAX_POLLS = 10
 
 
 class _Locator(Protocol):
@@ -142,12 +144,12 @@ class DomAxBrowserAdapter:
         )
 
     def execute(self, step: Mapping[str, object]) -> Mapping[str, object] | None:
-        """Execute one semantic step, then require a bounded quiet state.
+        """Execute one semantic step and confirm its strongest local evidence.
 
         Live refs return ``None``. Durable replay returns the step pruned to the
         locators confirmed in this capture. The editable-combobox step contains
-        one fill and one freshly grounded option click. A settle error means an
-        action may already have happened.
+        one fill and one freshly grounded option click. Fill and option actions
+        use field-owned readback; generic clicks still use bounded page quiet.
         """
 
         if step.get("op") == "choose_combobox_option":
@@ -156,9 +158,20 @@ class DomAxBrowserAdapter:
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
         if isinstance(target, Mapping) and target.get("by") == "ref":
-            self._execute_ref_step(step, target)
+            locator = self._execute_ref_step(step, target)
         else:
-            effective_step = self._execute_durable_step(step)
+            locator, effective_step = self._execute_durable_step(step)
+
+        operation = step.get("op")
+        if operation in {"fill", "select_option"}:
+            if self._wait_for_readback(
+                lambda: self._typed_readback_matches(locator, operation, step)
+            ):
+                return effective_step
+            raise ActionDispatchedError(
+                f"{operation} was dispatched but field readback was unresolved"
+            )
+
         try:
             self._wait_until_stable()
         except Exception as exc:
@@ -171,8 +184,8 @@ class DomAxBrowserAdapter:
         self,
         step: Mapping[str, object],
         target: Mapping[str, object],
-    ) -> None:
-        """Execute a ref only against the snapshot that created it."""
+    ) -> _Locator:
+        """Execute a ref and return the same live field for local readback."""
 
         operation = step.get("op")
         expected = {
@@ -196,11 +209,12 @@ class DomAxBrowserAdapter:
             label=label if isinstance(label, str) else None,
         )
         _execute_locator(locator, operation, step)
+        return locator
 
     def _execute_durable_step(
         self,
         step: Mapping[str, object],
-    ) -> Mapping[str, object]:
+    ) -> tuple[_Locator, Mapping[str, object]]:
         """Preflight a witnessed target in a fresh capture, then execute it."""
 
         action = action_from_step(step)
@@ -213,7 +227,10 @@ class DomAxBrowserAdapter:
             candidate_provider=self._locator_candidate_provider,
         )
         _execute_locator(locator, step.get("op"), step)
-        return action_to_step(_action_with_target(action, effective_target))
+        effective_step = action_to_step(
+            _action_with_target(action, effective_target)
+        )
+        return locator, effective_step
 
     def _execute_choose_combobox_option(
         self,
@@ -263,8 +280,7 @@ class DomAxBrowserAdapter:
         original_value = _editable_value(field_locator)
         try:
             field_locator.fill(label)
-            self._wait_until_stable()
-            option_locator = self._grounder.resolve_fresh_option(label)
+            option_locator = self._wait_for_fresh_option(label)
         except Exception as exc:
             try:
                 if field_target is None:
@@ -276,7 +292,11 @@ class DomAxBrowserAdapter:
                         fallback_mode="stored_candidates",
                     )
                 restore_locator.fill(original_value)
-                self._wait_until_stable()
+                restored = self._wait_for_readback(
+                    lambda: _editable_value(restore_locator) == original_value
+                )
+                if not restored:
+                    raise ValueError("combobox value could not be restored")
             except Exception as restore_error:
                 raise ActionDispatchedError(
                     "combobox preparation failed and its prior value could not "
@@ -288,14 +308,15 @@ class DomAxBrowserAdapter:
 
         # Once the option click is attempted, never click it again here. Any
         # settle, fresh-field lookup, or readback uncertainty is post-dispatch.
-        try:
-            option_locator.click()
-            self._wait_until_stable()
+        option_locator.click()
+        readback_target: DurableTarget | None = None
+
+        def commit_matches() -> bool:
+            nonlocal readback_target
             if field_target is None:
                 readback_locator = field_handle
-                readback_target = None
             else:
-                readback_locator, readback_target = (
+                readback_locator, confirmed_target = (
                     self._grounder.resolve_durable_target(
                         field_target,
                         "choose_combobox_option",
@@ -303,18 +324,81 @@ class DomAxBrowserAdapter:
                         candidate_provider=self._locator_candidate_provider,
                     )
                 )
-            if not self._combobox_commit_matches(readback_locator, label):
-                raise ValueError("editable combobox has no matching commit evidence")
-        except Exception as exc:
+                readback_target = confirmed_target
+            return self._combobox_commit_matches(readback_locator, label)
+
+        if not self._wait_for_readback(commit_matches):
             raise ActionDispatchedError(
                 "combobox option click was dispatched but could not be verified"
-            ) from exc
+            )
 
         if effective_target is None:
             return None
         if readback_target is None:
             raise AssertionError("durable combobox replay lost its target")
         return action_to_step(ChooseComboboxOption(readback_target, label))
+
+    def _wait_for_fresh_option(self, label: str) -> _Locator:
+        """Wait only for one freshly grounded exact option, not global quiet."""
+
+        last_error: Exception | None = None
+        for _ in range(_READBACK_MAX_POLLS):
+            self._page.wait_for_timeout(_POLL_MS)
+            try:
+                return self._grounder.resolve_fresh_option(label)
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise ValueError("combobox option was not available")
+
+    def _wait_for_readback(self, matches: Callable[[], bool]) -> bool:
+        """Require a local positive signal to persist for two render turns."""
+
+        stable_matches = 0
+        for _ in range(_READBACK_MAX_POLLS):
+            self._page.wait_for_timeout(_POLL_MS)
+            try:
+                matched = matches()
+            except Exception:
+                matched = False
+            stable_matches = stable_matches + 1 if matched else 0
+            if stable_matches >= _READBACK_STABLE_MATCHES:
+                return True
+        return False
+
+    def _typed_readback_matches(
+        self,
+        locator: _Locator,
+        operation: object,
+        step: Mapping[str, object],
+    ) -> bool:
+        """Check a field's own value or selected label after one dispatch."""
+
+        try:
+            if operation == "fill":
+                expected = step.get("value")
+                return (
+                    isinstance(expected, str)
+                    and _editable_value(locator) == expected
+                )
+            if operation == "select_option":
+                expected = step.get("label")
+                if not isinstance(expected, str):
+                    return False
+                selected = locator.evaluate(
+                    """element => Array.from(element.selectedOptions || [])
+                        .map(option => String(option.label || option.textContent || '')
+                            .replace(/\\s+/g, ' ').trim())"""
+                )
+                return isinstance(selected, list) and selected == [
+                    _normalize_text(expected)
+                ]
+            return False
+        except Exception:
+            # Dispatch already happened. A detached or unreadable field is not
+            # evidence of failure or success, so the caller reports unresolved.
+            return False
 
     def _combobox_commit_matches(
         self,
