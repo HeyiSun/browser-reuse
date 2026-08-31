@@ -235,7 +235,7 @@ class DomAxBrowserAdapter:
         if not isinstance(token, str) or not isinstance(ref, str):
             raise ValueError("snapshot-ref target requires string identity")
         label = step.get("label") if operation == "select_option" else None
-        locator = self._grounder.resolve_ref(
+        locator = self._resolve_source_ref(
             token,
             ref,
             str(operation),
@@ -243,6 +243,26 @@ class DomAxBrowserAdapter:
         )
         _execute_locator(locator, operation, step)
         return locator
+
+    def _resolve_source_ref(
+        self,
+        token: str,
+        ref: str,
+        operation: str,
+        *,
+        label: str | None = None,
+    ) -> _Locator:
+        """Classify every live-ref rejection before dispatch as recoverable."""
+
+        try:
+            return self._grounder.resolve_ref(
+                token,
+                ref,
+                operation,
+                label=label,
+            )
+        except ValueError as exc:
+            raise ActionNotCommittedError(str(exc)) from exc
 
     def _execute_durable_step(
         self,
@@ -288,12 +308,15 @@ class DomAxBrowserAdapter:
             ref = target.get("ref")
             if not isinstance(token, str) or not isinstance(ref, str):
                 raise ValueError("snapshot-ref target requires string identity")
-            field_locator = self._grounder.resolve_ref(
+            field_locator = self._resolve_source_ref(
                 token,
                 ref,
                 "choose_combobox_option",
             )
-            field_target = self._grounder.durable_target_for_ref(token, ref)
+            try:
+                field_target = self._grounder.durable_target_for_ref(token, ref)
+            except ValueError as exc:
+                raise ActionNotCommittedError(str(exc)) from exc
             effective_target = None
         else:
             action = action_from_step(step)
