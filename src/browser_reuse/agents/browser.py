@@ -76,6 +76,7 @@ unchanged witness before execution.
 # This is the complete provider-neutral message budget at the ChatModel boundary:
 # both the fixed system prompt and the final UTF-8 user message count toward it.
 _MODEL_PAYLOAD_BUDGET_BYTES = 64_000
+_MAX_APPEARS_NAME_CHARS = 160
 _SNAPSHOT_REF = re.compile(r"(?:^|\s)\[ref=([^\]\s]+)\]\s*$")
 
 
@@ -208,11 +209,26 @@ def _new_appeared_fact(
         return None
     before_counts = _readback_fact_counts(before)
     after_counts = _readback_fact_counts(after)
-    rank = {"heading": 0, "alert": 1, "status": 2, "dialog": 3}
+    rank = {
+        "heading": 0,
+        "alert": 1,
+        "status": 2,
+        "dialog": 3,
+        "link": 4,
+        "menuitem": 5,
+        "button": 6,
+        "tab": 7,
+        "option": 8,
+    }
     candidates = [
         fact
         for fact, count in after_counts.items()
-        if count == 1 and before_counts[fact] == 0 and fact[0] in rank
+        if (
+            count == 1
+            and before_counts[fact] == 0
+            and fact[0] in rank
+            and len(fact[1]) <= _MAX_APPEARS_NAME_CHARS
+        )
     ]
     if not candidates:
         return None

@@ -116,11 +116,24 @@ _CONTEXT_ANCESTOR_ROLES = frozenset(
         "tabpanel",
     }
 )
-_READBACK_ROLES = frozenset({"alert", "dialog", "heading", "status"})
+_READBACK_ROLES = frozenset(
+    {
+        "alert",
+        "button",
+        "dialog",
+        "heading",
+        "link",
+        "menuitem",
+        "option",
+        "status",
+        "tab",
+    }
+)
 # These budgets fail closed before an oversized snapshot reaches the model.
 _MAX_SELECT_OPTIONS = 40
 _MAX_CONTROLS = 200
 _MAX_SNAPSHOT_BYTES = 64_000
+_MAX_READBACK_NAME_CHARS = 160
 _DURABLE_READY_TIMEOUT_SECONDS = 8.0
 _DURABLE_READY_POLL_MS = 200
 _CLASS_HINT_WORDS = frozenset(
@@ -1764,6 +1777,7 @@ def _readback_facts(
         if (
             role in _READBACK_ROLES
             and name
+            and len(name) <= _MAX_READBACK_NAME_CHARS
             and isinstance(node.get("backendDOMNodeId"), int)
             and not isinstance(node.get("backendDOMNodeId"), bool)
             and not _ax_ignored(node)

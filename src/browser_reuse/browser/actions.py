@@ -22,7 +22,17 @@ class Appears:
     name: str
 
     def __post_init__(self) -> None:
-        if self.role not in {"alert", "dialog", "heading", "status"}:
+        if self.role not in {
+            "alert",
+            "button",
+            "dialog",
+            "heading",
+            "link",
+            "menuitem",
+            "option",
+            "status",
+            "tab",
+        }:
             raise ValueError("appears readback has an unsupported role")
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("appears readback requires a name")
