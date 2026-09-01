@@ -35,6 +35,7 @@ _STABLE_MATCHES = 2
 _MAX_POLLS = 40
 _READBACK_STABLE_MATCHES = 2
 _READBACK_MAX_POLLS = 10
+_CLICK_READBACK_MAX_POLLS = 40
 
 
 class _Locator(Protocol):
@@ -198,7 +199,8 @@ class DomAxBrowserAdapter:
                     click_readback.role,
                     click_readback.name,
                 )
-                == 1
+                == 1,
+                max_polls=_CLICK_READBACK_MAX_POLLS,
             ):
                 return effective_step
             raise ActionDispatchedError(
@@ -408,11 +410,16 @@ class DomAxBrowserAdapter:
             raise last_error
         raise ValueError("combobox option was not available")
 
-    def _wait_for_readback(self, matches: Callable[[], bool]) -> bool:
+    def _wait_for_readback(
+        self,
+        matches: Callable[[], bool],
+        *,
+        max_polls: int = _READBACK_MAX_POLLS,
+    ) -> bool:
         """Require a local positive signal to persist for two render turns."""
 
         stable_matches = 0
-        for _ in range(_READBACK_MAX_POLLS):
+        for _ in range(max_polls):
             self._page.wait_for_timeout(_POLL_MS)
             try:
                 matched = matches()
