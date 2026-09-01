@@ -67,6 +67,7 @@ _GENERATED_ID_PATTERNS = (
     re.compile(r"(?:^|[-_])\d{4,}(?:$|[-_])"),
     re.compile(r"^[a-z][a-z0-9_-]*\d{3,}$", re.IGNORECASE),
     re.compile(r"^(?:mantine|radix|headlessui|react)[-_:]", re.IGNORECASE),
+    re.compile(r"^rc_select_\d+(?:_list(?:_\d+)?)?$", re.IGNORECASE),
     re.compile(r"(?:^|[-_])(?:checkout|order|session)[-_][0-9a-f-]{8,}$", re.I),
 )
 # XPath accepts only the two canonical shapes admitted by the grounder/provider.

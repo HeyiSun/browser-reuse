@@ -29,9 +29,17 @@ executable without being compilable; fresh-context replay and the hard verifier
 decide whether a recipe can be published.
 
 Fill and option actions confirm their own field state. A click may optionally
-require one exact named AX heading, alert, status, or dialog that was absent
-before source dispatch and appeared afterward. Page quiet and URL change are not
-readback. Runtime values remain outcome evidence and never become target identity.
+require one exact bounded named AX outcome fact that was absent before source
+dispatch and appeared afterward. This includes semantic page states and named
+interactive facts, but excludes long composite names. Page quiet and URL change
+are not readback. Runtime values remain outcome evidence and never become target
+identity.
+
+For custom comboboxes, a recipe stores only the witnessed field and exact option
+text. Editable fields are filled; readonly fields are opened. The popup option is
+freshly observed, gets only a snapshot-local ref, and is clicked once. Replay then
+confirms field-owned selected/value evidence. Ambiguous owners or options fail
+before dispatch.
 
 The current grounder supports the main document and open shadow DOM. Iframes,
 OOPIFs, and closed shadow DOM fail closed. Navigation bootstrap, business tasks,

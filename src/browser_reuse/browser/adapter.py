@@ -153,9 +153,9 @@ class DomAxBrowserAdapter:
         """Execute one semantic step and confirm its strongest local evidence.
 
         Live refs return ``None``. Durable replay returns the step pruned to the
-        locators confirmed in this capture. The editable-combobox step contains
-        one fill and one freshly grounded option click. Fill and option actions
-        use field-owned readback; generic clicks still use bounded page quiet.
+        locators confirmed in this capture. A custom-combobox step prepares its
+        field and performs one freshly grounded option click. Fill and option
+        actions use field-owned readback; generic clicks use bounded page quiet.
         """
 
         if step.get("op") == "choose_combobox_option":
@@ -291,7 +291,7 @@ class DomAxBrowserAdapter:
         self,
         step: Mapping[str, object],
     ) -> Mapping[str, object] | None:
-        """Type, freshly ground one option, click once, then verify its commit."""
+        """Prepare a field, freshly ground one option, and verify one click."""
 
         if set(step) != {"op", "target", "label"}:
             raise ValueError("invalid choose_combobox_option action")
@@ -334,12 +334,20 @@ class DomAxBrowserAdapter:
 
         field_handle = field_locator.element_handle()
         if field_handle is None:
-            raise ValueError("editable combobox has no live element handle")
-        original_value = _editable_value(field_locator)
+            raise ValueError("combobox has no live element handle")
+        editable = field_locator.is_editable()
+        original_value = _editable_value(field_locator) if editable else ""
         try:
-            field_locator.fill(label)
+            if editable:
+                field_locator.fill(label)
+            elif field_locator.get_attribute("aria-expanded") != "true":
+                field_locator.click()
             option_locator = self._wait_for_fresh_option(label)
         except Exception as exc:
+            if not editable:
+                raise ActionNotCommittedError(
+                    "combobox option was not uniquely available before click"
+                ) from exc
             try:
                 if field_target is None:
                     restore_locator = field_handle
@@ -367,22 +375,26 @@ class DomAxBrowserAdapter:
         # Once the option click is attempted, never click it again here. Any
         # settle, fresh-field lookup, or readback uncertainty is post-dispatch.
         option_locator.click()
-        readback_target: DurableTarget | None = None
+        readback_target = effective_target
 
         def commit_matches() -> bool:
             nonlocal readback_target
+            try:
+                if self._combobox_commit_matches(field_handle, label):
+                    return True
+            except Exception:
+                pass
             if field_target is None:
-                readback_locator = field_handle
-            else:
-                readback_locator, confirmed_target = (
-                    self._grounder.resolve_durable_target(
-                        field_target,
-                        "choose_combobox_option",
-                        fallback_mode=self._locator_fallback,
-                        candidate_provider=self._locator_candidate_provider,
-                    )
+                return False
+            readback_locator, confirmed_target = (
+                self._grounder.resolve_durable_target(
+                    field_target,
+                    "choose_combobox_option",
+                    fallback_mode=self._locator_fallback,
+                    candidate_provider=self._locator_candidate_provider,
                 )
-                readback_target = confirmed_target
+            )
+            readback_target = confirmed_target
             return self._combobox_commit_matches(readback_locator, label)
 
         if not self._wait_for_readback(commit_matches):

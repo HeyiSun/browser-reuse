@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .actions import Click, action_to_step
+from .actions import ChooseComboboxOption, Click, action_to_step
 from .targets import (
     BrowserLocator,
     ClassLocator,
@@ -264,6 +264,7 @@ class _ActionableNode:
     attributes: Mapping[str, str]
     class_name: str | None
     role: str
+    ax_name: str
     name: str
     operation: str
     contexts: tuple[_ContextEvidence, ...]
@@ -312,6 +313,7 @@ class _RefBinding:
     name: str
     state: tuple[tuple[str, object], ...]
     labels: tuple[str, ...]
+    option_label: str | None
     requires_dom_clickable: bool
 
 
@@ -479,6 +481,7 @@ class DomAxGrounder:
                 targets_by_ref = self._attach_durable_targets(
                     controls,
                     frozen_actionable_nodes,
+                    marker_attribute,
                 )
                 verification = self._page.context.new_cdp_session(self._page)
                 try:
@@ -517,6 +520,9 @@ class DomAxGrounder:
             backend_id = control.pop("_backend_id", None)
             if not isinstance(backend_id, int):
                 raise RuntimeError("published browser ref lost its backend identity")
+            option_label = control.pop("_option_label", None)
+            if option_label is not None and not isinstance(option_label, str):
+                raise RuntimeError("published option ref has an invalid label")
             bindings[ref] = _RefBinding(
                 marker=_Marker(marker_attribute, ref),
                 operation=str(control["op"]),
@@ -526,6 +532,7 @@ class DomAxGrounder:
                 name=str(control.pop("_name")),
                 state=tuple(control.pop("_state")),
                 labels=tuple(control.get("labels", ())),
+                option_label=option_label,
                 requires_dom_clickable=bool(
                     control.pop("_requires_dom_clickable")
                 ),
@@ -592,7 +599,7 @@ class DomAxGrounder:
         ):
             raise ValueError("browser ref belongs to a stale observation")
         binding = self._bindings.get(ref)
-        if binding is None or binding.operation != operation:
+        if binding is None or not _binding_supports_operation(binding, operation):
             raise ValueError("browser ref/action is not present in the observation")
 
         session = self._page.context.new_cdp_session(self._page)
@@ -647,10 +654,17 @@ class DomAxGrounder:
             raise ValueError("browser ref no longer resolves to its live node")
         if not locator.is_visible() or not locator.is_enabled():
             raise ValueError("browser ref is no longer actionable")
-        if operation == "click" and not _receives_pointer_events(locator):
+        trigger_click = (
+            operation == "choose_combobox_option"
+            and binding.operation == "click"
+        )
+        if (
+            operation == "click" or trigger_click
+        ) and not _receives_pointer_events(locator):
             raise ValueError("browser ref is obscured by another element")
         if (
             operation in {"fill", "choose_combobox_option"}
+            and not trigger_click
             and not locator.is_editable()
         ):
             raise ValueError("browser ref is no longer editable")
@@ -681,12 +695,14 @@ class DomAxGrounder:
             ref
             for ref, binding in self._bindings.items()
             if binding.operation == "click"
-            and binding.role == "option"
-            and binding.name == label
+            and (
+                binding.option_label == label
+                or (binding.role == "option" and binding.name == label)
+            )
         ]
         if len(matches) != 1:
             raise ValueError(
-                "editable combobox requires one fresh exact witnessed option"
+                "custom combobox requires one fresh exact witnessed option"
             )
         return self.resolve_ref(snapshot.token, matches[0], "click")
 
@@ -841,20 +857,19 @@ class DomAxGrounder:
 
         role = _ax_text(ax_node.get("role")).lower()
         name = _ax_text(ax_node.get("name"))
-        dom_click_name = name or _dom_click_name(dom_node.attributes)
         semantic_operation = _operation(role, dom_node.tag)
-        operation = _operation(
-            role,
-            dom_node.tag,
-            dom_node.clickable and bool(dom_click_name),
-        )
-        requires_dom_clickable = semantic_operation is None and operation == "click"
         if (
-            operation is None
-            or dom_node.closed_shadow
+            dom_node.closed_shadow
             or (
                 dom_node.tag == "input"
                 and dom_node.attributes.get("type", "").casefold() == "file"
+            )
+            or (
+                semantic_operation is None
+                and (
+                    not dom_node.clickable
+                    or role in _DOM_CLICK_EXCLUDED_ROLES
+                )
             )
         ):
             return None
@@ -869,6 +884,31 @@ class DomAxGrounder:
             locator.count() != 1
             or not locator.is_visible()
             or not locator.is_enabled()
+        ):
+            _remove_marker(session, backend_id, marker)
+            return None
+
+        option_label: str | None = None
+        dom_click_name = name or _dom_click_name(dom_node.attributes)
+        if (
+            semantic_operation is None
+            and dom_node.clickable
+            and "aria-selected" in dom_node.attributes
+        ):
+            option_label = _single_short_visible_text(locator)
+            if not dom_click_name:
+                dom_click_name = option_label or ""
+
+        operation = _operation(
+            role,
+            dom_node.tag,
+            dom_node.clickable and bool(dom_click_name),
+        )
+        if role == "combobox" and dom_node.tag != "select":
+            operation = "choose_combobox_option" if locator.is_editable() else "click"
+        requires_dom_clickable = semantic_operation is None and operation == "click"
+        if (
+            operation is None
             or (
                 operation in {"fill", "choose_combobox_option"}
                 and not locator.is_editable()
@@ -881,8 +921,13 @@ class DomAxGrounder:
         public_name = (
             "" if secret and _name_contains_live_value(locator, name) else name
         )
+        if role == "combobox" and not secret:
+            public_name = _combobox_field_name(locator, public_name)
         if not public_name and dom_node.clickable and not secret:
-            public_name = _dom_click_name(dom_node.attributes)
+            public_name = dom_click_name
+        if role == "combobox" and operation == "click" and not public_name:
+            _remove_marker(session, backend_id, marker)
+            return None
         control: dict[str, object] = {"op": operation, "name": public_name}
         public_state = _public_dom_state(
             dom_node.attributes,
@@ -933,7 +978,12 @@ class DomAxGrounder:
                     dom_node.attributes.get("class", "")
                 ),
                 role=role,
-                name=name if public_name == name else "",
+                ax_name="" if secret and public_name != name else name,
+                name=(
+                    public_name
+                    if role == "combobox" and not secret
+                    else name if public_name == name else ""
+                ),
                 operation=operation,
                 contexts=contexts,
                 in_shadow=dom_node.in_shadow,
@@ -945,6 +995,8 @@ class DomAxGrounder:
         control["_role"] = role
         control["_name"] = name
         control["_state"] = _semantic_state(ax_node)
+        if option_label is not None:
+            control["_option_label"] = option_label
         control["_requires_dom_clickable"] = requires_dom_clickable
         controls[ref] = control
         return ref, public_name
@@ -953,11 +1005,14 @@ class DomAxGrounder:
         self,
         controls: dict[str, dict[str, object]],
         nodes: tuple[_ActionableNode, ...],
+        marker_attribute: str,
     ) -> dict[str, DurableTarget]:
         """Attach targets independently; a usable ref may remain non-compilable."""
 
         targets: dict[str, DurableTarget] = {}
         for node in nodes:
+            if controls[node.ref].get("_option_label") is not None:
+                continue
             try:
                 target = self._build_durable_target(
                     node,
@@ -968,6 +1023,21 @@ class DomAxGrounder:
             if target is not None:
                 controls[node.ref]["target"] = action_to_step(Click(target))["target"]
                 targets[node.ref] = target
+
+        for node in nodes:
+            option_label = controls[node.ref].get("_option_label")
+            if not isinstance(option_label, str):
+                continue
+            owner_ref = _expanded_combobox_owner_ref(
+                self._page,
+                marker_attribute,
+                node.ref,
+            )
+            owner_target = targets.get(owner_ref) if owner_ref is not None else None
+            if owner_target is not None:
+                controls[node.ref]["recipe_step"] = action_to_step(
+                    ChooseComboboxOption(owner_target, option_label)
+                )
         return targets
 
     def _build_durable_target(
@@ -1070,7 +1140,7 @@ class DomAxGrounder:
             return tuple(
                 node.backend_id
                 for node in self._actionable_nodes
-                if node.role == locator.role and node.name == locator.name
+                if node.role == locator.role and node.ax_name == locator.name
             )
         if isinstance(locator, CssLocator):
             page_locator = self._page.locator(locator.selector)
@@ -1217,6 +1287,191 @@ def _editable_value(locator: _Locator) -> str:
         }"""
     )
     return value if isinstance(value, str) else ""
+
+
+def _combobox_field_name(locator: _Locator, accessible_name: str) -> str:
+    """Recover one stable field label before considering container text."""
+
+    if accessible_name:
+        return accessible_name
+    try:
+        value = locator.evaluate(
+            """(element, maxChars) => {
+                const normalize = value => String(value || '')
+                    .replace(/\\s+/g, ' ').trim();
+                const acceptable = value => {
+                    const text = normalize(value);
+                    return text && text.length <= maxChars ? text : '';
+                };
+                const visible = candidate => {
+                    if (!candidate || candidate.closest('[hidden], [aria-hidden="true"]')) {
+                        return false;
+                    }
+                    const style = getComputedStyle(candidate);
+                    const rect = candidate.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && rect.width > 0 && rect.height > 0;
+                };
+
+                const root = element.getRootNode();
+                const labelledBy = normalize(element.getAttribute('aria-labelledby'));
+                if (labelledBy) {
+                    const text = labelledBy.split(/\\s+/)
+                        .map(id => {
+                            const label = root.getElementById
+                                ? root.getElementById(id)
+                                : document.getElementById(id);
+                            return label?.textContent || '';
+                        })
+                        .join(' ');
+                    if (acceptable(text)) return acceptable(text);
+                }
+                for (const label of Array.from(element.labels || [])) {
+                    if (visible(label) && acceptable(label.textContent)) {
+                        return acceptable(label.textContent);
+                    }
+                }
+                const wrappingLabel = element.closest('label');
+                if (visible(wrappingLabel) && acceptable(wrappingLabel.textContent)) {
+                    return acceptable(wrappingLabel.textContent);
+                }
+
+                const ancestors = [];
+                for (let current = element.parentElement;
+                     current && ancestors.length < 12;
+                     current = current.parentElement) {
+                    if (current.querySelectorAll('[role="combobox"]').length === 1) {
+                        ancestors.push(current);
+                    }
+                }
+                for (const ancestor of ancestors) {
+                    const labels = Array.from(ancestor.querySelectorAll('label'))
+                        .filter(visible)
+                        .map(label => acceptable(label.textContent))
+                        .filter(Boolean);
+                    if (labels.length === 1) return labels[0];
+                }
+
+                for (const attribute of ['placeholder', 'aria-placeholder']) {
+                    const text = acceptable(element.getAttribute(attribute));
+                    if (text) return text;
+                }
+                for (const ancestor of ancestors) {
+                    const walker = document.createTreeWalker(
+                        ancestor,
+                        NodeFilter.SHOW_TEXT,
+                    );
+                    const chunks = [];
+                    while (walker.nextNode()) {
+                        const parent = walker.currentNode.parentElement;
+                        if (!visible(parent)) continue;
+                        if (parent.closest('[role="listbox"], [role="option"]')) continue;
+                        const text = acceptable(walker.currentNode.textContent);
+                        if (text) chunks.push(text);
+                    }
+                    if (chunks.length === 1) return chunks[0];
+                }
+                return '';
+            }""",
+            _MAX_READBACK_NAME_CHARS,
+        )
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _single_short_visible_text(locator: _Locator) -> str | None:
+    """Read one option-like text leaf without turning container text into a ref."""
+
+    try:
+        value = locator.evaluate(
+            """(element, maxChars) => {
+                const normalize = value => String(value || '')
+                    .replace(/\\s+/g, ' ').trim();
+                const walker = document.createTreeWalker(
+                    element,
+                    NodeFilter.SHOW_TEXT,
+                );
+                const chunks = [];
+                while (walker.nextNode()) {
+                    const parent = walker.currentNode.parentElement;
+                    if (!parent || parent.closest('[hidden], [aria-hidden="true"]')) {
+                        continue;
+                    }
+                    const style = getComputedStyle(parent);
+                    const rect = parent.getBoundingClientRect();
+                    if (style.display === 'none' || style.visibility === 'hidden'
+                        || rect.width <= 0 || rect.height <= 0) {
+                        continue;
+                    }
+                    const text = normalize(walker.currentNode.textContent);
+                    if (text) chunks.push(text);
+                }
+                return chunks.length === 1 && chunks[0].length <= maxChars
+                    ? chunks[0]
+                    : '';
+            }""",
+            _MAX_READBACK_NAME_CHARS,
+        )
+    except Exception:
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def _expanded_combobox_owner_ref(
+    page: _Page,
+    marker_attribute: str,
+    option_ref: str,
+) -> str | None:
+    """Find one expanded owner, preferring an explicit controls/owns relation."""
+
+    option = page.locator(
+        _marker_selector(_Marker(marker_attribute, option_ref))
+    )
+    try:
+        value = option.evaluate(
+            """(element, markerAttribute) => {
+                const root = element.getRootNode();
+                if (!root.querySelectorAll) return null;
+                const visible = candidate => {
+                    const style = getComputedStyle(candidate);
+                    const rect = candidate.getBoundingClientRect();
+                    return !candidate.disabled && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0 && rect.height > 0;
+                };
+                const owners = Array.from(root.querySelectorAll(
+                    '[role="combobox"][aria-expanded="true"]',
+                )).filter(visible);
+                const ancestorIds = new Set();
+                for (let current = element; current; current = current.parentElement) {
+                    if (current.id) ancestorIds.add(current.id);
+                }
+                const explicitlyRelated = owners.filter(owner => {
+                    const ids = [
+                        owner.getAttribute('aria-controls'),
+                        owner.getAttribute('aria-owns'),
+                    ].flatMap(value => String(value || '').split(/\\s+/)).filter(Boolean);
+                    return ids.some(id => {
+                        const controlled = root.getElementById
+                            ? root.getElementById(id)
+                            : document.getElementById(id);
+                        return ancestorIds.has(id)
+                            || Boolean(controlled && controlled.contains(element));
+                    });
+                });
+                const owner = explicitlyRelated.length === 1
+                    ? explicitlyRelated[0]
+                    : explicitlyRelated.length === 0 && owners.length === 1
+                    ? owners[0]
+                    : null;
+                return owner ? owner.getAttribute(markerAttribute) : null;
+            }""",
+            marker_attribute,
+        )
+    except Exception:
+        return None
+    return value if isinstance(value, str) and value else None
 
 
 def _receives_pointer_events(locator: _Locator) -> bool:
@@ -1380,7 +1635,9 @@ def _candidate_locators(
         except ValueError:
             continue
 
-    locators.append(RoleLocator(node.role, node.name))
+    # Keep this locator faithful to native AX. A custom combobox may expose a
+    # DOM-derived field label to the model and witness, but it is not an AX name.
+    locators.append(RoleLocator(node.role, node.ax_name))
     if node.class_name is not None:
         locators.append(ClassLocator(node.tag, node.class_name))
     anchored = _anchored_xpath(node, witness)
@@ -1649,6 +1906,16 @@ def _operation(role: str, tag: str, dom_clickable: bool = False) -> str | None:
     return None
 
 
+def _binding_supports_operation(binding: _RefBinding, operation: str) -> bool:
+    """Let a readonly combobox field back the semantic choose action."""
+
+    return binding.operation == operation or (
+        operation == "choose_combobox_option"
+        and binding.operation == "click"
+        and binding.role == "combobox"
+    )
+
+
 def _dom_click_name(attributes: Mapping[str, str]) -> str:
     """Return a bounded semantic hint for a DOM-clickable AX-generic node."""
 
@@ -1881,7 +2148,14 @@ def _first_admissible_class(value: str) -> str | None:
     """Return one filtered class hint without promoting it to witness evidence."""
 
     return next(
-        (token for token in value.split() if is_admissible_class_token(token)),
+        (
+            token
+            for token in value.split()
+            if not token.casefold().startswith(
+                ("ant-", "css-dev-only-do-not-override-")
+            )
+            and is_admissible_class_token(token)
+        ),
         None,
     )
 

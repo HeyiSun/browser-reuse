@@ -79,7 +79,7 @@ class SelectOption:
 
 @dataclass(frozen=True)
 class ChooseComboboxOption:
-    """Choose one exact option from an editable, non-native combobox."""
+    """Choose one exact option from a non-native combobox field."""
 
     target: BrowserTarget
     label: str
