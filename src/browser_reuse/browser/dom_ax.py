@@ -121,6 +121,8 @@ _READBACK_ROLES = frozenset({"alert", "dialog", "heading", "status"})
 _MAX_SELECT_OPTIONS = 40
 _MAX_CONTROLS = 200
 _MAX_SNAPSHOT_BYTES = 64_000
+_DURABLE_READY_TIMEOUT_SECONDS = 8.0
+_DURABLE_READY_POLL_MS = 200
 _CLASS_HINT_WORDS = frozenset(
     {"checked", "closed", "disabled", "error", "loading", "open", "selected"}
 )
@@ -1089,11 +1091,26 @@ class DomAxGrounder:
         if fallback_mode == "stored_then_llm" and candidate_provider is None:
             raise ValueError("stored_then_llm requires a locator candidate provider")
 
-        snapshot = self._capture(include_targets=False)
-        witness_matches = _matching_nodes(self._actionable_nodes, target.witness)
-        if len(witness_matches) != 1:
-            raise ValueError("durable target witness is no longer unique")
-        intended = witness_matches[0]
+        deadline = time.monotonic() + _DURABLE_READY_TIMEOUT_SECONDS
+        while True:
+            snapshot = self._capture(include_targets=False)
+            witness_matches = _matching_nodes(
+                self._actionable_nodes,
+                target.witness,
+            )
+            if len(witness_matches) > 1:
+                raise ValueError("durable target witness is ambiguous")
+            if len(witness_matches) == 1:
+                intended = witness_matches[0]
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError(
+                    "durable target did not become actionable before timeout"
+                )
+            self._page.wait_for_timeout(
+                min(_DURABLE_READY_POLL_MS, remaining * 1_000)
+            )
 
         stored_candidates = (
             target.locators[:1] if fallback_mode == "none" else target.locators
