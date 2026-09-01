@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
@@ -52,6 +53,11 @@ choose a different next step or done. Use recent_actions as recent tool-attempt
 history, not proof that every attempted effect committed. Do not repeat a
 selection that the fresh page already shows as established. The caller
 independently verifies the final state.
+
+visited_page_evidence contains grounded facts from earlier page states. Its
+entries are evidence only: old refs are never actionable. When cycle_nudge is
+present, stop revisiting those states. Combine the collected evidence if it is
+complete, otherwise choose a genuinely unvisited or changed state.
 """
 
 LOCATOR_CANDIDATE_PROMPT = """You propose locator hints for one already witnessed webpage element.
@@ -77,7 +83,23 @@ unchanged witness before execution.
 # both the fixed system prompt and the final UTF-8 user message count toward it.
 _MODEL_PAYLOAD_BUDGET_BYTES = 64_000
 _MAX_APPEARS_NAME_CHARS = 160
+_MAX_PAGE_EVIDENCE_BYTES = 2_048
+_MAX_PAGE_EVIDENCE_RECORDS = 8
+_MAX_PAGE_FACT_NAME_CHARS = 240
 _SNAPSHOT_REF = re.compile(r"(?:^|\s)\[ref=([^\]\s]+)\]\s*$")
+_SNAPSHOT_FACT = re.compile(
+    r'^\s*-\s+(?P<role>[a-z][a-z0-9_-]*)'
+    r'(?:\s+(?P<name>"(?:[^"\\]|\\.)*"))?'
+)
+_PAGE_EVIDENCE_EXCLUDED_ROLES = frozenset(
+    {"generic", "inlinetextbox", "none", "rootwebarea"}
+)
+_CYCLE_NUDGE = (
+    "The last two actions only revisited page states already inspected and "
+    "added no new evidence. Do not continue this cycle. Use "
+    "visited_page_evidence to combine what was found, or choose a state not "
+    "represented there."
+)
 
 
 def run_generic_browser_agent(
@@ -91,22 +113,37 @@ def run_generic_browser_agent(
     """Run the high-level DOM+AX Agent without exposing loop protocol hooks."""
 
     recent_actions: list[dict[str, object]] = []
+    page_history: list[tuple[str, dict[str, object]]] = []
+    revisit_streak = 0
     public_state_before_action: object = None
     visible_refs: frozenset[str] = frozenset()
 
     def messages(task: TaskSpec, observation: Observation) -> tuple[Message, ...]:
-        nonlocal visible_refs
+        nonlocal revisit_streak, visible_refs
         current_public_state = _public_state(observation)
         changed = (
             None
             if not recent_actions
             else current_public_state != public_state_before_action
         )
+        current_evidence = _page_evidence(observation)
+        current_key = _page_state_key(observation, current_evidence)
+        known_state = any(key == current_key for key, _ in page_history)
+        if recent_actions:
+            revisit_streak = revisit_streak + 1 if known_state else 0
+        if not known_state:
+            page_history.append((current_key, current_evidence))
+            del page_history[:-_MAX_PAGE_EVIDENCE_RECORDS]
+        visited_evidence = [
+            record for key, record in page_history if key != current_key
+        ]
         result, visible_refs = _message_bundle(
             task,
             observation,
             recent_actions=recent_actions,
             page_changed_after_last_action=changed,
+            visited_page_evidence=visited_evidence,
+            cycle_nudge=_CYCLE_NUDGE if revisit_streak >= 2 else None,
             system_prompt=GENERIC_BROWSER_PROMPT + prompt_suffix,
         )
         return result
@@ -322,6 +359,8 @@ def _messages(
     *,
     recent_actions: Sequence[Mapping[str, object]] = (),
     page_changed_after_last_action: bool | None = None,
+    visited_page_evidence: Sequence[Mapping[str, object]] = (),
+    cycle_nudge: str | None = None,
     system_prompt: str = GENERIC_BROWSER_PROMPT,
 ) -> tuple[Message, ...]:
     messages, _ = _message_bundle(
@@ -329,6 +368,8 @@ def _messages(
         observation,
         recent_actions=recent_actions,
         page_changed_after_last_action=page_changed_after_last_action,
+        visited_page_evidence=visited_page_evidence,
+        cycle_nudge=cycle_nudge,
         system_prompt=system_prompt,
     )
     return messages
@@ -340,6 +381,8 @@ def _message_bundle(
     *,
     recent_actions: Sequence[Mapping[str, object]] = (),
     page_changed_after_last_action: bool | None = None,
+    visited_page_evidence: Sequence[Mapping[str, object]] = (),
+    cycle_nudge: str | None = None,
     system_prompt: str = GENERIC_BROWSER_PROMPT,
 ) -> tuple[tuple[Message, ...], frozenset[str]]:
     """Build one bounded message without splitting snapshot or action records."""
@@ -358,7 +401,9 @@ def _message_bundle(
         lines.append((index, line, ref))
 
     history = [dict(action) for action in recent_actions]
+    evidence = [dict(record) for record in visited_page_evidence]
     selected_history = history[-1:]  # The last action is safety-critical feedback.
+    selected_evidence: list[dict[str, object]] = []
     selected_lines: dict[int, str] = {}
     selected_controls: dict[str, dict[str, object]] = {}
 
@@ -366,6 +411,7 @@ def _message_bundle(
         candidate_lines: Mapping[int, str],
         candidate_controls: Mapping[str, Mapping[str, object]],
         candidate_history: Sequence[Mapping[str, object]],
+        candidate_evidence: Sequence[Mapping[str, object]],
     ) -> str:
         ordered_snapshot = "\n".join(
             line for _, line in sorted(candidate_lines.items())
@@ -382,6 +428,8 @@ def _message_bundle(
             "last_action_error": observation.data.get("last_action_error"),
             "recent_actions": list(candidate_history),
             "page_changed_after_last_action": page_changed_after_last_action,
+            "visited_page_evidence": list(candidate_evidence),
+            "cycle_nudge": cycle_nudge,
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -392,12 +440,33 @@ def _message_bundle(
             <= _MODEL_PAYLOAD_BUDGET_BYTES
         )
 
-    user_content = content_for(selected_lines, selected_controls, selected_history)
+    user_content = content_for(
+        selected_lines,
+        selected_controls,
+        selected_history,
+        selected_evidence,
+    )
     if not fits(user_content):
         raise ValueError(
             "browser model payload cannot fit the 64000-byte budget without "
             "dropping the goal, page identity, or latest action"
         )
+
+    # Reserve a bounded slice for earlier page facts. Each record is kept or
+    # dropped whole, newest first, so no evidence is cut into invalid JSON.
+    for record in reversed(evidence):
+        candidate_evidence = [record, *selected_evidence]
+        candidate_content = content_for(
+            selected_lines,
+            selected_controls,
+            selected_history,
+            candidate_evidence,
+        )
+        if fits(candidate_content):
+            selected_evidence = candidate_evidence
+            user_content = candidate_content
+        else:
+            break
 
     # Keep executable controls first. Each candidate is admitted together with
     # its complete snapshot line and complete public control object.
@@ -411,6 +480,7 @@ def _message_bundle(
             candidate_lines,
             candidate_controls,
             selected_history,
+            selected_evidence,
         )
         if fits(candidate_content):
             selected_lines = candidate_lines
@@ -425,6 +495,7 @@ def _message_bundle(
             selected_lines,
             selected_controls,
             candidate_history,
+            selected_evidence,
         )
         if fits(candidate_content):
             selected_history = candidate_history
@@ -442,6 +513,7 @@ def _message_bundle(
             candidate_lines,
             selected_controls,
             selected_history,
+            selected_evidence,
         )
         if fits(candidate_content):
             selected_lines = candidate_lines
@@ -539,6 +611,63 @@ def _public_state(observation: Observation) -> dict[str, object]:
         "snapshot": observation.data.get("snapshot"),
         "controls": _public_controls(observation),
     }
+
+
+def _page_evidence(observation: Observation) -> dict[str, object]:
+    """Keep a small ref-free set of named facts from one public snapshot."""
+
+    url = observation.data.get("url")
+    title = observation.data.get("title")
+    facts: list[str] = []
+    seen: set[str] = set()
+    snapshot = observation.data.get("snapshot")
+    if isinstance(snapshot, str):
+        for line in snapshot.splitlines():
+            match = _SNAPSHOT_FACT.match(line)
+            if match is None or match.group("name") is None:
+                continue
+            role = match.group("role")
+            if role in _PAGE_EVIDENCE_EXCLUDED_ROLES:
+                continue
+            try:
+                name = json.loads(match.group("name"))
+            except json.JSONDecodeError:
+                continue
+            if (
+                not isinstance(name, str)
+                or not name
+                or len(name) > _MAX_PAGE_FACT_NAME_CHARS
+            ):
+                continue
+            fact = f"{role}: {name}"
+            if fact in seen:
+                continue
+            candidate = {"url": url, "title": title, "facts": [*facts, fact]}
+            if len(json.dumps(candidate, ensure_ascii=False).encode("utf-8")) > (
+                _MAX_PAGE_EVIDENCE_BYTES
+            ):
+                continue
+            facts.append(fact)
+            seen.add(fact)
+    return {"url": url, "title": title, "facts": facts}
+
+
+def _page_state_key(
+    observation: Observation,
+    evidence: Mapping[str, object],
+) -> str:
+    """Fingerprint semantics and live field state without capture-local refs."""
+
+    controls = sorted(
+        json.dumps(control, ensure_ascii=False, sort_keys=True)
+        for control in _public_controls(observation).values()
+    )
+    value = json.dumps(
+        {"evidence": dict(evidence), "controls": controls},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _public_controls(

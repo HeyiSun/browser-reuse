@@ -6,6 +6,11 @@ observation from its optional replay step. `browser.py` adds the site-neutral
 DOM+AX prompt, grounded action parser, bounded action-attempt history, and
 `run_generic_browser_agent()` proven by two public benchmark sites.
 
+The Agent also retains a bounded list of ref-free semantic facts from earlier
+page states. It is deterministic evidence extraction, not model-authored
+memory. Revisiting already-seen states twice adds a nudge but never hard-stops
+the loop; current controls and refs always come from the fresh observation.
+
 A post-dispatch unresolved action remains in the trajectory for diagnosis but
 has no recipe step. The browser Agent may add one mechanically observed exact
 `Appears` condition when a named AX fact was absent before the click and unique
