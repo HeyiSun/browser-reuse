@@ -263,7 +263,10 @@ class DomAxBrowserAdapter:
                 operation,
                 label=label,
             )
-        except ValueError as exc:
+        # ``resolve_ref`` is a read-only preflight. Even a Playwright/CDP
+        # protocol failure here happened before ``_execute_locator`` and is
+        # therefore safe for the Agent to diagnose from a fresh observation.
+        except Exception as exc:
             raise ActionNotCommittedError(str(exc)) from exc
 
     def _execute_durable_step(
