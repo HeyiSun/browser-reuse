@@ -41,6 +41,13 @@ freshly observed, gets only a snapshot-local ref, and is clicked once. Replay th
 confirms field-owned selected/value evidence. Ambiguous owners or options fail
 before dispatch.
 
+The Agent still uses a plain click for a checkbox or radio. When source
+before/after observations prove a boolean transition on the same witnessed
+control, the compiler stores `SetChecked` instead. Replay treats it as a target
+state: an already-satisfied target is a zero-click success; otherwise the exact
+target is clicked once and reread locally, including after a DOM remount. It
+never retries the click or waits for unrelated page quiet.
+
 The current grounder supports the main document and open shadow DOM. Iframes,
 OOPIFs, and closed shadow DOM fail closed. Navigation bootstrap, business tasks,
 and verifiers remain outside this package.

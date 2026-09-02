@@ -20,6 +20,10 @@ For a custom combobox popup, `ActionPlan` deliberately executes the temporary
 option ref while storing `ChooseComboboxOption(field, exact label)` as the recipe
 step. The popup ref never crosses the observation boundary.
 
+A source radio/checkbox gesture also remains `click(ref)`. If its grounded
+before/after state proves an exact boolean transition on the same witness, the
+post-run compiler replaces only the recipe step with `SetChecked(target, state)`.
+
 An explicit model `done` remains an unverified success claim. An outer hard
 verifier may permit candidate compilation; only fresh-context full replay plus
 the same verifier makes that candidate verified. Task goals, site bootstrap,

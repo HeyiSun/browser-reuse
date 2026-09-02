@@ -15,6 +15,7 @@ from .actions import (
     Click,
     Fill,
     SelectOption,
+    SetChecked,
     action_from_step,
     action_to_step,
 )
@@ -160,6 +161,8 @@ class DomAxBrowserAdapter:
 
         if step.get("op") == "choose_combobox_option":
             return self._execute_choose_combobox_option(step)
+        if step.get("op") == "set_checked":
+            return self._execute_set_checked(step)
 
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
@@ -411,6 +414,62 @@ class DomAxBrowserAdapter:
             raise AssertionError("durable combobox replay lost its target")
         return action_to_step(ChooseComboboxOption(readback_target, label))
 
+    def _execute_set_checked(
+        self,
+        step: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Reach one witnessed choice state with at most one click."""
+
+        action = action_from_step(step)
+        if not isinstance(action, SetChecked):
+            raise ValueError("invalid set_checked action")
+        locator, target = self._grounder.resolve_durable_target(
+            action.target,
+            "set_checked",
+            fallback_mode=self._locator_fallback,
+            candidate_provider=self._locator_candidate_provider,
+        )
+        kind, current = _checked_control_state(locator)
+        if kind is None or current is None:
+            raise ValueError("set_checked target has no exact boolean state")
+        if kind == "radio" and not action.checked:
+            raise ValueError("a radio target cannot be set to unchecked")
+        if current == action.checked:
+            return action_to_step(SetChecked(target, action.checked))
+
+        # This is the only commit point. Readback may re-resolve the witnessed
+        # node, but it never dispatches a second click.
+        locator.click()
+        readback_locator = locator
+        readback_target = target
+
+        def commit_matches() -> bool:
+            nonlocal readback_locator, readback_target
+            try:
+                live_kind, live_state = _checked_control_state(readback_locator)
+                if live_kind == kind and live_state == action.checked:
+                    return True
+            except Exception:
+                pass
+            try:
+                fresh, confirmed = self._grounder.resolve_durable_target(
+                    target,
+                    "set_checked",
+                    fallback_mode="stored_candidates",
+                )
+            except Exception:
+                return False
+            readback_locator = fresh
+            readback_target = confirmed
+            live_kind, live_state = _checked_control_state(fresh)
+            return live_kind == kind and live_state == action.checked
+
+        if not self._wait_for_readback(commit_matches):
+            raise ActionDispatchedError(
+                "set_checked was dispatched but target readback was unresolved"
+            )
+        return action_to_step(SetChecked(readback_target, action.checked))
+
     def _wait_for_fresh_option(self, label: str) -> _Locator:
         """Wait only for one freshly grounded exact option, not global quiet."""
 
@@ -627,7 +686,9 @@ def _action_with_target(
         return Fill(target, action.value)
     if isinstance(action, SelectOption):
         return SelectOption(target, action.label)
-    return ChooseComboboxOption(target, action.label)
+    if isinstance(action, ChooseComboboxOption):
+        return ChooseComboboxOption(target, action.label)
+    return SetChecked(target, action.checked)
 
 
 def _editable_value(locator: _Locator | _ElementHandle) -> str:
@@ -647,3 +708,33 @@ def _normalize_text(value: object) -> str:
     """Compare browser readback without treating harmless whitespace as drift."""
 
     return " ".join(str(value or "").split())
+
+
+def _checked_control_state(
+    locator: _Locator,
+) -> tuple[str | None, bool | None]:
+    """Read only the exact target's native or ARIA checked state."""
+
+    value = locator.evaluate(
+        """element => {
+            const tag = element.tagName.toLowerCase();
+            const type = String(element.getAttribute('type') || '').toLowerCase();
+            if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
+                return {kind: type, checked: Boolean(element.checked)};
+            }
+            const role = String(element.getAttribute('role') || '').toLowerCase();
+            if (role !== 'checkbox' && role !== 'radio') return null;
+            const checked = element.getAttribute('aria-checked');
+            if (checked !== 'true' && checked !== 'false') {
+                return {kind: role, checked: null};
+            }
+            return {kind: role, checked: checked === 'true'};
+        }"""
+    )
+    if not isinstance(value, Mapping):
+        return None, None
+    kind = value.get("kind")
+    checked = value.get("checked")
+    if kind not in {"checkbox", "radio"} or not isinstance(checked, bool):
+        return None, None
+    return str(kind), checked

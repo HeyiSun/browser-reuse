@@ -90,7 +90,22 @@ class ChooseComboboxOption:
             raise ValueError("combobox option label must not be empty")
 
 
-BrowserAction: TypeAlias = Click | Fill | SelectOption | ChooseComboboxOption
+@dataclass(frozen=True)
+class SetChecked:
+    """Make one checkbox or radio match a witnessed boolean state."""
+
+    target: BrowserTarget
+    checked: bool
+
+    def __post_init__(self) -> None:
+        _validate_target(self.target)
+        if not isinstance(self.checked, bool):
+            raise ValueError("set checked requires a boolean state")
+
+
+BrowserAction: TypeAlias = (
+    Click | Fill | SelectOption | ChooseComboboxOption | SetChecked
+)
 
 
 def action_to_step(action: BrowserAction) -> dict[str, object]:
@@ -110,11 +125,13 @@ def action_to_step(action: BrowserAction) -> dict[str, object]:
         return {"op": "fill", "target": target, "value": action.value}
     if isinstance(action, SelectOption):
         return {"op": "select_option", "target": target, "label": action.label}
-    return {
-        "op": "choose_combobox_option",
-        "target": target,
-        "label": action.label,
-    }
+    if isinstance(action, ChooseComboboxOption):
+        return {
+            "op": "choose_combobox_option",
+            "target": target,
+            "label": action.label,
+        }
+    return {"op": "set_checked", "target": target, "checked": action.checked}
 
 
 def action_from_step(step: Mapping[str, object]) -> BrowserAction:
@@ -125,6 +142,7 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
         "fill": {"op", "target", "value"},
         "select_option": {"op", "target", "label"},
         "choose_combobox_option": {"op", "target", "label"},
+        "set_checked": {"op", "target", "checked"},
     }
     if operation == "click":
         if set(step) not in (
@@ -160,6 +178,11 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
         if not isinstance(value, str):
             raise ValueError("fill requires a string value")
         return Fill(target, value)
+    if operation == "set_checked":
+        checked = step.get("checked")
+        if not isinstance(checked, bool):
+            raise ValueError("set_checked requires a boolean state")
+        return SetChecked(target, checked)
     label = step.get("label")
     if not isinstance(label, str) or not label:
         raise ValueError(f"{operation} requires a non-empty label")

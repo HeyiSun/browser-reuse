@@ -659,7 +659,7 @@ class DomAxGrounder:
             and binding.operation == "click"
         )
         if (
-            operation == "click" or trigger_click
+            operation in {"click", "set_checked"} or trigger_click
         ) and not _receives_pointer_events(locator):
             raise ValueError("browser ref is obscured by another element")
         if (
@@ -931,6 +931,7 @@ class DomAxGrounder:
         control: dict[str, object] = {"op": operation, "name": public_name}
         public_state = _public_dom_state(
             dom_node.attributes,
+            checked=_ax_property(ax_node, "checked"),
             include_raw_class=self._include_raw_class,
         )
         if public_state:
@@ -1907,12 +1908,16 @@ def _operation(role: str, tag: str, dom_clickable: bool = False) -> str | None:
 
 
 def _binding_supports_operation(binding: _RefBinding, operation: str) -> bool:
-    """Let a readonly combobox field back the semantic choose action."""
+    """Map recipe semantics onto the live action supported by one binding."""
 
     return binding.operation == operation or (
         operation == "choose_combobox_option"
         and binding.operation == "click"
         and binding.role == "combobox"
+    ) or (
+        operation == "set_checked"
+        and binding.operation == "click"
+        and binding.role in {"checkbox", "radio"}
     )
 
 
@@ -2163,11 +2168,14 @@ def _first_admissible_class(value: str) -> str | None:
 def _public_dom_state(
     attributes: Mapping[str, str],
     *,
+    checked: object = None,
     include_raw_class: bool,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Expose bounded UI state for decisions, never for durable identity."""
 
-    state: dict[str, str] = {}
+    state: dict[str, object] = {}
+    if isinstance(checked, bool) or checked == "mixed":
+        state["checked"] = checked
     for key in ("aria-pressed", "aria-selected", "aria-checked", "data-state"):
         value = attributes.get(key)
         if value:

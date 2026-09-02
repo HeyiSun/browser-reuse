@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from browser_reuse.browser.actions import (
     Appears,
     Click,
+    SetChecked,
     action_from_step,
     action_to_step,
 )
@@ -179,23 +180,30 @@ def run_generic_browser_agent(
         max_decisions=max_decisions,
         allow_done_claim=True,
     )
-    return _attach_click_readbacks(run)
+    return _attach_click_outcomes(run)
 
 
-def _attach_click_readbacks(run: AgentRun) -> AgentRun:
-    """Add one observed exact Appears condition to eligible click records."""
+def _attach_click_outcomes(run: AgentRun) -> AgentRun:
+    """Compile observed click effects into replayable state or fact actions."""
 
     actions: list[RecordedAction] = []
     for record in run.actions:
-        readback = _new_appeared_fact(record.before, record.after)
         click = _recorded_click(record)
-        if readback is None or click is None:
+        if click is None:
+            actions.append(record)
+            continue
+        checked = _new_checked_state(record, click)
+        if checked is not None:
+            recipe_step = action_to_step(SetChecked(click.target, checked))
+        elif (readback := _new_appeared_fact(record.before, record.after)) is not None:
+            recipe_step = action_to_step(Click(click.target, readback))
+        else:
             actions.append(record)
             continue
         actions.append(
             RecordedAction(
                 execute_step=record.execute_step,
-                recipe_step=action_to_step(Click(click.target, readback)),
+                recipe_step=recipe_step,
                 before=record.before,
                 after=record.after,
             )
@@ -234,6 +242,93 @@ def _recorded_click(record: RecordedAction) -> Click | None:
     except ValueError:
         return None
     return action if isinstance(action, Click) else None
+
+
+def _new_checked_state(record: RecordedAction, click: Click) -> bool | None:
+    """Infer one checkbox/radio target state from a real source transition."""
+
+    role = _target_role(action_to_step(click).get("target"))
+    if role not in {"checkbox", "radio"} or record.after is None:
+        return None
+    before_control = _executed_ref_control(record.before, record.execute_step)
+    if before_control is None:
+        return None
+    before = _control_checked_state(before_control)
+    target = action_to_step(click).get("target")
+    after_control = _control_matching_target(record.after, target)
+    after = _control_checked_state(after_control)
+    if before is None or after is None or before == after:
+        return None
+    if role == "radio" and not after:
+        return None
+    return after
+
+
+def _executed_ref_control(
+    observation: Observation,
+    step: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    target = step.get("target")
+    ref = target.get("ref") if isinstance(target, Mapping) else None
+    controls = observation.data.get("controls")
+    control = (
+        controls.get(ref)
+        if isinstance(controls, Mapping) and isinstance(ref, str)
+        else None
+    )
+    return control if isinstance(control, Mapping) else None
+
+
+def _control_matching_target(
+    observation: Observation,
+    target: object,
+) -> Mapping[str, object] | None:
+    """Find one fresh control with the same mechanical witness."""
+
+    witness = target.get("witness") if isinstance(target, Mapping) else None
+    if not isinstance(witness, Mapping):
+        return None
+    controls = observation.data.get("controls")
+    if not isinstance(controls, Mapping):
+        return None
+    matches = [
+        control
+        for control in controls.values()
+        if isinstance(control, Mapping)
+        and isinstance(control.get("target"), Mapping)
+        and control["target"].get("witness") == witness
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _target_role(target: object) -> str | None:
+    locators = target.get("locators") if isinstance(target, Mapping) else None
+    if not isinstance(locators, list):
+        return None
+    roles = {
+        locator.get("role")
+        for locator in locators
+        if isinstance(locator, Mapping)
+        and locator.get("by") == "role"
+        and isinstance(locator.get("role"), str)
+    }
+    return next(iter(roles)) if len(roles) == 1 else None
+
+
+def _control_checked_state(control: object) -> bool | None:
+    if not isinstance(control, Mapping):
+        return None
+    state = control.get("state")
+    if not isinstance(state, Mapping):
+        return None
+    values: set[bool] = set()
+    for key in ("checked", "aria-checked"):
+        value = state.get(key)
+        if isinstance(value, bool):
+            values.add(value)
+        elif isinstance(value, str) and value.casefold() in {"true", "false"}:
+            values.add(value.casefold() == "true")
+    return next(iter(values)) if len(values) == 1 else None
 
 
 def _new_appeared_fact(
