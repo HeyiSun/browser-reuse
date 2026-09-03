@@ -166,9 +166,12 @@ class DomAxBrowserAdapter:
 
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
+        readback_target: DurableTarget | None = None
         click_readback: Appears | None = None
         if isinstance(target, Mapping) and target.get("by") == "ref":
-            locator = self._execute_ref_step(step, target)
+            locator, readback_target, dispatched = self._execute_ref_step(
+                step, target
+            )
         else:
             action = action_from_step(step)
             if isinstance(action, Click):
@@ -184,13 +187,52 @@ class DomAxBrowserAdapter:
                     raise ValueError(
                         "click readback already holds before dispatch"
                     )
-            locator, effective_step = self._execute_durable_step(step)
+            locator, effective_step, dispatched = self._execute_durable_step(step)
+            readback_target = action_from_step(effective_step).target
 
         operation = step.get("op")
         if operation in {"fill", "select_option"}:
-            if self._wait_for_readback(
-                lambda: self._typed_readback_matches(locator, operation, step)
-            ):
+            if not dispatched:
+                return effective_step
+            readback_locator = locator
+            confirmed_target = readback_target
+
+            def commit_matches() -> bool:
+                nonlocal confirmed_target, readback_locator
+                if self._typed_readback_matches(
+                    readback_locator, operation, step
+                ):
+                    return True
+                if confirmed_target is None:
+                    return False
+                label = (
+                    step.get("label")
+                    if operation == "select_option"
+                    else None
+                )
+                try:
+                    fresh, confirmed = self._grounder.resolve_durable_target(
+                        confirmed_target,
+                        str(operation),
+                        label=label if isinstance(label, str) else None,
+                        fallback_mode="stored_candidates",
+                    )
+                except Exception:
+                    return False
+                readback_locator = fresh
+                confirmed_target = confirmed
+                return self._typed_readback_matches(
+                    readback_locator, operation, step
+                )
+
+            if self._wait_for_readback(commit_matches):
+                if effective_step is not None and confirmed_target is not None:
+                    return action_to_step(
+                        _action_with_target(
+                            action_from_step(effective_step),
+                            confirmed_target,
+                        )
+                    )
                 return effective_step
             raise ActionDispatchedError(
                 f"{operation} was dispatched but field readback was unresolved"
@@ -222,8 +264,8 @@ class DomAxBrowserAdapter:
         self,
         step: Mapping[str, object],
         target: Mapping[str, object],
-    ) -> _Locator:
-        """Execute a ref and return the same live field for local readback."""
+    ) -> tuple[_Locator, DurableTarget | None, bool]:
+        """Resolve a ref, then dispatch only when its desired state is absent."""
 
         operation = step.get("op")
         expected = {
@@ -246,8 +288,16 @@ class DomAxBrowserAdapter:
             str(operation),
             label=label if isinstance(label, str) else None,
         )
+        try:
+            durable_target = self._grounder.durable_target_for_ref(token, ref)
+        except Exception as exc:
+            raise ActionNotCommittedError(str(exc)) from exc
+        if operation in {"fill", "select_option"} and self._typed_readback_matches(
+            locator, operation, step
+        ):
+            return locator, durable_target, False
         _execute_locator(locator, operation, step)
-        return locator
+        return locator, durable_target, True
 
     def _resolve_source_ref(
         self,
@@ -275,7 +325,7 @@ class DomAxBrowserAdapter:
     def _execute_durable_step(
         self,
         step: Mapping[str, object],
-    ) -> tuple[_Locator, Mapping[str, object]]:
+    ) -> tuple[_Locator, Mapping[str, object], bool]:
         """Preflight a witnessed target in a fresh capture, then execute it."""
 
         action = action_from_step(step)
@@ -287,11 +337,16 @@ class DomAxBrowserAdapter:
             fallback_mode=self._locator_fallback,
             candidate_provider=self._locator_candidate_provider,
         )
-        _execute_locator(locator, step.get("op"), step)
         effective_step = action_to_step(
             _action_with_target(action, effective_target)
         )
-        return locator, effective_step
+        operation = step.get("op")
+        if operation in {"fill", "select_option"} and self._typed_readback_matches(
+            locator, operation, step
+        ):
+            return locator, effective_step, False
+        _execute_locator(locator, operation, step)
+        return locator, effective_step, True
 
     def _execute_choose_combobox_option(
         self,

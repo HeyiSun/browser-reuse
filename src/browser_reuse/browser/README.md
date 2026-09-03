@@ -35,6 +35,11 @@ interactive facts, but excludes long composite names. Page quiet and URL change
 are not readback. Runtime values remain outcome evidence and never become target
 identity.
 
+Fill and native select are desired-state operations. If the exact value or
+label already holds, execution is a zero-dispatch success. After one write, a
+detached locator may be replaced only by fresh resolution of the same durable
+witness with stored candidates; readback never asks an LLM or writes twice.
+
 For custom comboboxes, a recipe stores only the witnessed field and exact option
 text. Editable fields are filled; readonly fields are opened. The popup option is
 freshly observed, gets only a snapshot-local ref, and is clicked once. Replay then
