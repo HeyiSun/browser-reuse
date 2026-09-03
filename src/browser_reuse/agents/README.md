@@ -16,6 +16,10 @@ has no recipe step. The browser Agent may add one mechanically observed exact
 `Appears` condition when a named AX fact was absent before the click and unique
 after it; this does not use model self-assessment.
 
+For a same-origin link, the compiler may instead attach `UrlIs` only when the
+source result exactly matches that link's live href. The href stays hidden from
+the model and outside target identity; replay rechecks it before one click.
+
 For a custom combobox popup, `ActionPlan` deliberately executes the temporary
 option ref while storing `ChooseComboboxOption(field, exact label)` as the recipe
 step. The popup ref never crosses the observation boundary.

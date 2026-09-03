@@ -7,11 +7,13 @@ import json
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from browser_reuse.browser.actions import (
     Appears,
     Click,
     SetChecked,
+    UrlIs,
     action_from_step,
     action_to_step,
 )
@@ -195,7 +197,13 @@ def _attach_click_outcomes(run: AgentRun) -> AgentRun:
         checked = _new_checked_state(record, click)
         if checked is not None:
             recipe_step = action_to_step(SetChecked(click.target, checked))
-        elif (readback := _new_appeared_fact(record.before, record.after)) is not None:
+        elif (relative_url := _new_link_url(record)) is not None:
+            recipe_step = action_to_step(
+                Click(click.target, UrlIs(relative_url))
+            )
+        elif (
+            readback := _new_appeared_fact(record.before, record.after)
+        ) is not None:
             recipe_step = action_to_step(Click(click.target, readback))
         else:
             actions.append(record)
@@ -262,6 +270,57 @@ def _new_checked_state(record: RecordedAction, click: Click) -> bool | None:
     if role == "radio" and not after:
         return None
     return after
+
+
+def _new_link_url(record: RecordedAction) -> str | None:
+    """Confirm a source navigation only when it exactly follows live href."""
+
+    if record.after is None:
+        return None
+    control = _executed_ref_control(record.before, record.execute_step)
+    link = control.get("link_destination") if control is not None else None
+    if (
+        not isinstance(link, Mapping)
+        or not isinstance(link.get("href"), str)
+        or link.get("target") not in {"", "_self"}
+        or link.get("download") is not False
+    ):
+        return None
+    before_url = record.before.data.get("url")
+    after_url = record.after.data.get("url")
+    if not isinstance(before_url, str) or not isinstance(after_url, str):
+        return None
+    destination_url = urljoin(before_url, str(link["href"]))
+    before = _http_origin_and_relative(before_url)
+    after = _http_origin_and_relative(after_url)
+    destination = _http_origin_and_relative(destination_url)
+    if before is None or after is None or destination is None:
+        return None
+    before_origin, before_relative = before
+    after_origin, after_relative = after
+    destination_origin, destination_relative = destination
+    if (
+        before_origin != after_origin
+        or before_origin != destination_origin
+        or before_relative == after_relative
+        or after_relative != destination_relative
+    ):
+        return None
+    return after_relative
+
+
+def _http_origin_and_relative(
+    value: str,
+) -> tuple[tuple[str, str], str] | None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.fragment
+    ):
+        return None
+    relative = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    return (parsed.scheme, parsed.netloc), relative
 
 
 def _executed_ref_control(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeAlias
+from urllib.parse import urlsplit, urlunsplit
 
 from .targets import (
     BrowserTarget,
@@ -39,16 +40,41 @@ class Appears:
 
 
 @dataclass(frozen=True)
+class UrlIs:
+    """Confirm a same-origin link at one exact relative path and query."""
+
+    relative_url: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.relative_url, str):
+            raise ValueError("url readback requires a relative URL string")
+        parsed = urlsplit(self.relative_url)
+        canonical = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.fragment
+            or not parsed.path.startswith("/")
+            or canonical != self.relative_url
+        ):
+            raise ValueError(
+                "url readback requires one canonical absolute path and query"
+            )
+
+
+@dataclass(frozen=True)
 class Click:
     """Click the unique node confirmed by a durable target."""
 
     target: BrowserTarget
-    readback: Appears | None = None
+    readback: Appears | UrlIs | None = None
 
     def __post_init__(self) -> None:
         _validate_target(self.target)
-        if self.readback is not None and not isinstance(self.readback, Appears):
-            raise ValueError("click readback must be an Appears condition")
+        if self.readback is not None and not isinstance(
+            self.readback, (Appears, UrlIs)
+        ):
+            raise ValueError("click readback has an unsupported condition")
 
 
 @dataclass(frozen=True)
@@ -114,11 +140,16 @@ def action_to_step(action: BrowserAction) -> dict[str, object]:
     target = _target_to_mapping(action.target)
     if isinstance(action, Click):
         step: dict[str, object] = {"op": "click", "target": target}
-        if action.readback is not None:
+        if isinstance(action.readback, Appears):
             step["readback"] = {
                 "kind": "appears",
                 "role": action.readback.role,
                 "name": action.readback.name,
+            }
+        elif isinstance(action.readback, UrlIs):
+            step["readback"] = {
+                "kind": "url_is",
+                "relative_url": action.readback.relative_url,
             }
         return step
     if isinstance(action, Fill):
@@ -157,22 +188,24 @@ def action_from_step(step: Mapping[str, object]) -> BrowserAction:
         readback = step.get("readback")
         if readback is None:
             return Click(target)
-        if not isinstance(readback, Mapping) or set(readback) != {
-            "kind",
-            "role",
-            "name",
-        }:
+        if not isinstance(readback, Mapping):
             raise ValueError("invalid click readback fields")
-        if readback.get("kind") != "appears":
-            raise ValueError("unsupported click readback kind")
-        role = readback.get("role")
-        name = readback.get("name")
-        if not isinstance(role, str) or not isinstance(name, str):
-            raise ValueError("click readback role and name must be strings")
-        return Click(
-            target,
-            Appears(role=role, name=name),
-        )
+        if readback.get("kind") == "appears":
+            if set(readback) != {"kind", "role", "name"}:
+                raise ValueError("invalid click readback fields")
+            role = readback.get("role")
+            name = readback.get("name")
+            if not isinstance(role, str) or not isinstance(name, str):
+                raise ValueError("click readback role and name must be strings")
+            return Click(target, Appears(role=role, name=name))
+        if readback.get("kind") == "url_is":
+            if set(readback) != {"kind", "relative_url"}:
+                raise ValueError("invalid click readback fields")
+            relative_url = readback.get("relative_url")
+            if not isinstance(relative_url, str):
+                raise ValueError("click url readback must be a string")
+            return Click(target, UrlIs(relative_url))
+        raise ValueError("unsupported click readback kind")
     if operation == "fill":
         value = step.get("value")
         if not isinstance(value, str):

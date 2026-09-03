@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from browser_reuse.core import Observation
 from browser_reuse.interfaces import ActionDispatchedError, ActionNotCommittedError
@@ -16,6 +17,7 @@ from .actions import (
     Fill,
     SelectOption,
     SetChecked,
+    UrlIs,
     action_from_step,
     action_to_step,
 )
@@ -163,6 +165,13 @@ class DomAxBrowserAdapter:
             return self._execute_choose_combobox_option(step)
         if step.get("op") == "set_checked":
             return self._execute_set_checked(step)
+        readback = step.get("readback")
+        if (
+            step.get("op") == "click"
+            and isinstance(readback, Mapping)
+            and readback.get("kind") == "url_is"
+        ):
+            return self._execute_url_click(step)
 
         target = step.get("target")
         effective_step: Mapping[str, object] | None = None
@@ -525,6 +534,39 @@ class DomAxBrowserAdapter:
             )
         return action_to_step(SetChecked(readback_target, action.checked))
 
+    def _execute_url_click(
+        self,
+        step: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Follow one same-origin link to its exact witnessed destination."""
+
+        action = action_from_step(step)
+        if not isinstance(action, Click) or not isinstance(
+            action.readback, UrlIs
+        ):
+            raise ValueError("invalid url-readback click action")
+        locator, target = self._grounder.resolve_durable_target(
+            action.target,
+            "click",
+            fallback_mode=self._locator_fallback,
+            candidate_provider=self._locator_candidate_provider,
+        )
+        expected = action.readback.relative_url
+        if _same_origin_link_destination(locator, self._page.url) != expected:
+            raise ValueError("link href does not match its exact URL readback")
+        if _relative_http_url(self._page.url) == expected:
+            return action_to_step(Click(target, action.readback))
+
+        locator.click()
+        if not self._wait_for_readback(
+            lambda: _relative_http_url(self._page.url) == expected,
+            max_polls=_CLICK_READBACK_MAX_POLLS,
+        ):
+            raise ActionDispatchedError(
+                "link click was dispatched but exact URL readback was unresolved"
+            )
+        return action_to_step(Click(target, action.readback))
+
     def _wait_for_fresh_option(self, label: str) -> _Locator:
         """Wait only for one freshly grounded exact option, not global quiet."""
 
@@ -793,3 +835,56 @@ def _checked_control_state(
     if kind not in {"checkbox", "radio"} or not isinstance(checked, bool):
         return None, None
     return str(kind), checked
+
+
+def _relative_http_url(value: str) -> str | None:
+    """Return one exact path and query for an HTTP URL without a fragment."""
+
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.fragment
+    ):
+        return None
+    return urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+
+
+def _same_origin_link_destination(
+    locator: _Locator,
+    current_url: str,
+) -> str | None:
+    """Read a same-tab anchor destination without using it as identity."""
+
+    value = locator.evaluate(
+        """element => ({
+            tag: element.tagName.toLowerCase(),
+            href: element.href || '',
+            target: element.getAttribute('target') || '',
+            download: element.hasAttribute('download'),
+        })"""
+    )
+    if not isinstance(value, Mapping):
+        return None
+    target = value.get("target")
+    if (
+        value.get("tag") != "a"
+        or value.get("download") is True
+        or target not in {"", "_self"}
+        or not isinstance(value.get("href"), str)
+    ):
+        return None
+    current = urlsplit(current_url)
+    destination = urlsplit(str(value["href"]))
+    if (
+        current.scheme not in {"http", "https"}
+        or destination.scheme not in {"http", "https"}
+        or not current.netloc
+        or current.scheme != destination.scheme
+        or current.netloc != destination.netloc
+        or destination.fragment
+    ):
+        return None
+    return urlunsplit(
+        ("", "", destination.path or "/", destination.query, "")
+    )

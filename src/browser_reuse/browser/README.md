@@ -30,10 +30,11 @@ decide whether a recipe can be published.
 
 Fill and option actions confirm their own field state. A click may optionally
 require one exact bounded named AX outcome fact that was absent before source
-dispatch and appeared afterward. This includes semantic page states and named
-interactive facts, but excludes long composite names. Page quiet and URL change
-are not readback. Runtime values remain outcome evidence and never become target
-identity.
+dispatch and appeared afterward. A same-origin anchor may instead require the
+exact relative path and query already declared by its live href. Arbitrary URL
+change, redirects, page quiet, and long composite names are not readback.
+Runtime values and link destinations remain outcome evidence and never become
+target identity.
 
 Fill and native select are desired-state operations. If the exact value or
 label already holds, execution is a zero-dispatch success. After one write, a

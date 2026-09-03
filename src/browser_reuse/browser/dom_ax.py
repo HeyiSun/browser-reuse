@@ -936,6 +936,14 @@ class DomAxGrounder:
         )
         if public_state:
             control["state"] = public_state
+        if dom_node.tag == "a" and role == "link":
+            href = dom_node.attributes.get("href")
+            if href:
+                control["link_destination"] = {
+                    "href": href,
+                    "target": dom_node.attributes.get("target", ""),
+                    "download": "download" in dom_node.attributes,
+                }
         if operation in {"fill", "choose_combobox_option"} and not secret:
             control["value"] = _editable_value(locator)
         elif operation == "select_option":
