@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
@@ -39,6 +40,7 @@ _MAX_POLLS = 40
 _READBACK_STABLE_MATCHES = 2
 _READBACK_MAX_POLLS = 10
 _CLICK_READBACK_MAX_POLLS = 40
+_MAX_LOGGED_PENDING_REQUESTS = 8
 
 
 class _Locator(Protocol):
@@ -126,7 +128,8 @@ class DomAxBrowserAdapter:
         self._locator_fallback = locator_fallback
         self._locator_candidate_provider = locator_candidate_provider
         # Streaming requests never settle, so the callbacks exclude them.
-        self._pending_requests: set[object] = set()
+        self._pending_requests: dict[object, float] = {}
+        self._last_settle_diagnostics: dict[str, object] | None = None
         on = getattr(page, "on", None)
         if callable(on):
             on("request", self._request_started)
@@ -149,6 +152,7 @@ class DomAxBrowserAdapter:
                     {"role": role, "name": name}
                     for role, name in snapshot.readback_facts
                 ],
+                "settle_diagnostics": self._last_settle_diagnostics,
             }
         )
 
@@ -161,6 +165,7 @@ class DomAxBrowserAdapter:
         actions use field-owned readback; generic clicks use bounded page quiet.
         """
 
+        self._last_settle_diagnostics = None
         if step.get("op") == "choose_combobox_option":
             return self._execute_choose_combobox_option(step)
         if step.get("op") == "set_checked":
@@ -714,18 +719,54 @@ class DomAxBrowserAdapter:
     def _wait_until_stable(self) -> None:
         """Wait for both non-streaming requests and DOM revisions to go quiet."""
 
+        started_at = time.monotonic()
         previous: tuple[str, str, int] | None = None
         stable_matches = 0
+        pending_min: int | None = None
+        pending_max = 0
+        pending_nonempty_polls = 0
+        url_changes = 0
+        ready_state_changes = 0
+        dom_revision_changes = 0
         for poll in range(_MAX_POLLS):
             self._page.wait_for_timeout(_POLL_MS)
-            state = self._page.evaluate(DOM_REVISION_SCRIPT)
-            if not isinstance(state, Mapping):
-                raise RuntimeError("browser did not return DOM quiet state")
-            ready = state.get("ready")
-            version = state.get("version")
-            if not isinstance(ready, str) or not isinstance(version, int):
-                raise RuntimeError("browser returned invalid DOM quiet state")
+            pending_count = len(self._pending_requests)
+            pending_min = (
+                pending_count
+                if pending_min is None
+                else min(pending_min, pending_count)
+            )
+            pending_max = max(pending_max, pending_count)
+            if pending_count:
+                pending_nonempty_polls += 1
+            try:
+                state = self._page.evaluate(DOM_REVISION_SCRIPT)
+                if not isinstance(state, Mapping):
+                    raise RuntimeError("browser did not return DOM quiet state")
+                ready = state.get("ready")
+                version = state.get("version")
+                if not isinstance(ready, str) or not isinstance(version, int):
+                    raise RuntimeError("browser returned invalid DOM quiet state")
+            except Exception as exc:
+                self._last_settle_diagnostics = self._settle_diagnostics(
+                    outcome="sampling_error",
+                    polls=poll + 1,
+                    started_at=started_at,
+                    pending_min=pending_min,
+                    pending_max=pending_max,
+                    pending_nonempty_polls=pending_nonempty_polls,
+                    previous=previous,
+                    url_changes=url_changes,
+                    ready_state_changes=ready_state_changes,
+                    dom_revision_changes=dom_revision_changes,
+                    sampling_error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
             current = (self._page.url, ready, version)
+            if previous is not None:
+                url_changes += current[0] != previous[0]
+                ready_state_changes += current[1] != previous[1]
+                dom_revision_changes += current[2] != previous[2]
             if (
                 not self._pending_requests
                 and ready != "loading"
@@ -736,16 +777,103 @@ class DomAxBrowserAdapter:
                 previous = current
                 stable_matches = 0
             if poll + 1 >= _MIN_POLLS and stable_matches >= _STABLE_MATCHES:
+                self._last_settle_diagnostics = self._settle_diagnostics(
+                    outcome="settled",
+                    polls=poll + 1,
+                    started_at=started_at,
+                    pending_min=pending_min,
+                    pending_max=pending_max,
+                    pending_nonempty_polls=pending_nonempty_polls,
+                    previous=current,
+                    url_changes=url_changes,
+                    ready_state_changes=ready_state_changes,
+                    dom_revision_changes=dom_revision_changes,
+                )
                 return
+        self._last_settle_diagnostics = self._settle_diagnostics(
+            outcome="timeout",
+            polls=_MAX_POLLS,
+            started_at=started_at,
+            pending_min=pending_min,
+            pending_max=pending_max,
+            pending_nonempty_polls=pending_nonempty_polls,
+            previous=previous,
+            url_changes=url_changes,
+            ready_state_changes=ready_state_changes,
+            dom_revision_changes=dom_revision_changes,
+        )
         raise TimeoutError("page did not reach a bounded network and DOM quiet state")
+
+    def _settle_diagnostics(
+        self,
+        *,
+        outcome: str,
+        polls: int,
+        started_at: float,
+        pending_min: int | None,
+        pending_max: int,
+        pending_nonempty_polls: int,
+        previous: tuple[str, str, int] | None,
+        url_changes: int,
+        ready_state_changes: int,
+        dom_revision_changes: int,
+        sampling_error: str | None = None,
+    ) -> dict[str, object]:
+        """Build one bounded, model-hidden record for settle diagnosis."""
+
+        now = time.monotonic()
+        pending = sorted(
+            self._pending_requests.items(),
+            key=lambda item: item[1],
+        )
+        requests = [
+            {
+                "method": _request_text(request, "method", 16),
+                "resource_type": _request_text(request, "resource_type", 32),
+                "url": _request_text(request, "url", 500),
+                "age_ms": round(max(0.0, now - request_started) * 1000, 3),
+            }
+            for request, request_started in pending[:_MAX_LOGGED_PENDING_REQUESTS]
+        ]
+        result: dict[str, object] = {
+            "outcome": outcome,
+            "polls": polls,
+            "elapsed_ms": round(max(0.0, now - started_at) * 1000, 3),
+            "pending_count_final": len(pending),
+            "pending_count_min": pending_min if pending_min is not None else 0,
+            "pending_count_max": pending_max,
+            "pending_nonempty_polls": pending_nonempty_polls,
+            "pending_requests": requests,
+            "pending_requests_truncated": max(0, len(pending) - len(requests)),
+            "url": previous[0] if previous is not None else self._page.url,
+            "ready_state": previous[1] if previous is not None else None,
+            "dom_revision": previous[2] if previous is not None else None,
+            "url_changes": url_changes,
+            "ready_state_changes": ready_state_changes,
+            "dom_revision_changes": dom_revision_changes,
+        }
+        if sampling_error is not None:
+            result["sampling_error"] = sampling_error[:500]
+        return result
 
     def _request_started(self, request: object) -> None:
         if getattr(request, "resource_type", "") in {"websocket", "eventsource"}:
             return
-        self._pending_requests.add(request)
+        self._pending_requests.setdefault(request, time.monotonic())
 
     def _request_finished(self, request: object) -> None:
-        self._pending_requests.discard(request)
+        self._pending_requests.pop(request, None)
+
+
+def _request_text(request: object, field: str, limit: int) -> str:
+    """Read one request label without letting diagnostics break execution."""
+
+    try:
+        value = getattr(request, field, "")
+    except Exception:
+        return "<unavailable>"
+    text = value if isinstance(value, str) else str(value)
+    return text if len(text) <= limit else f"{text[:limit]}…"
 
 
 def _execute_locator(
