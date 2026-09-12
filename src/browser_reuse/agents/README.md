@@ -4,7 +4,7 @@ The formal Agent boundary contains `RecordedAction`, `AgentRun`, and the bounded
 `run_agent_loop()`. `ActionPlan` separates the step executed in the current
 observation from its optional replay step. `browser.py` adds the site-neutral
 DOM+AX prompt, grounded action parser, bounded action-attempt history, and
-`run_generic_browser_agent()` proven by two public benchmark sites.
+`run_generic_browser_agent()`.
 
 The Agent also retains a bounded list of ref-free semantic facts from earlier
 page states. It is deterministic evidence extraction, not model-authored

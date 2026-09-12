@@ -5,10 +5,10 @@ one responsibility:
 
 | Module | Responsibility |
 |---|---|
-| `actions.py` | Typed actions, exact `Appears` readback, and the strict codec |
+| `actions.py` | Typed actions, `Appears` / `UrlIs` readback, and the strict codec |
 | `targets.py` | Locator candidates, witnesses, durable targets, and validation |
 | `dom_ax.py` | DOM+AX capture, refs, targets, AX facts, and replay preflight |
-| `adapter.py` | Browser execution plus field-owned and `Appears` readback |
+| `adapter.py` | Browser execution, desired-state actions, and positive readback |
 | `runtime.py` | Playwright and fresh browser-context ownership |
 
 The dependency direction stays simple:
